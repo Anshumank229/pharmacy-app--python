@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import dj_database_url
 
 load_dotenv()
 
@@ -23,7 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-cblf^td!!i60xrl-_b41x^-+kp0yu41z)ve@ca(t9j(05lj+ul'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -78,16 +79,26 @@ WSGI_APPLICATION = 'core.wsgi.application'
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
 # NEW POSTGRESQL SETUP
+# ==========================================
+# DATABASE SETTINGS
+# ==========================================
+# This brilliantly uses your local database on your computer,
+# but automatically switches to the Cloud database when deployed!
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'pyhton_edtech -medicine_selling',
-        'USER': 'postgres',            # Your pgAdmin username (usually postgres)
-        'PASSWORD': 'anshuman2002',   # Type your actual pgAdmin password here!
-        'HOST': 'localhost',           # Local machine
-        'PORT': '5432',                # Default Postgres port
-    }
+    'default': dj_database_url.config(
+        default=os.getenv('DATABASE_URL'),
+        conn_max_age=600
+    )
 }
+
+# ==========================================
+# STATIC & MEDIA FILES
+# ==========================================
+STATIC_URL = 'static/'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles') # <-- NEW: Required for cloud
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 
 # Password validation

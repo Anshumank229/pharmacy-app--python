@@ -1,6 +1,6 @@
 # inventory/models.py
 from django.db import models
-
+from django.core.validators import MinValueValidator, MaxValueValidator
 
 class Category(models.Model):
     name = models.CharField(max_length=100, unique=True)
@@ -49,10 +49,11 @@ class Order(models.Model):
         ('DELIVERED', 'Delivered'),
     )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    total_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 
     # --- PRESCRIPTION IMAGE PATH ---
-    prescription_image = models.CharField(max_length=255, null=True, blank=True)
+    prescription_image = models.ImageField(upload_to='prescriptions/', null=True, blank=True)
 
     def __str__(self):
         return f"Order #{self.id} - {self.customer_name}"
@@ -71,7 +72,7 @@ class OrderItem(models.Model):
 class Review(models.Model):
     medicine = models.ForeignKey(Medicine, related_name='reviews', on_delete=models.CASCADE)
     customer_name = models.CharField(max_length=100)
-    rating = models.PositiveSmallIntegerField(choices=[(i, str(i)) for i in range(1, 6)])
+    rating = models.PositiveSmallIntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
     comment = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

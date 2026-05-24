@@ -1,17 +1,19 @@
+# main.py
 import os
 import django
+import secrets
+import shutil
 
 # 1. SETUP FIRST
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
 django.setup()
 
-import shutil
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
 from django.core.wsgi import get_wsgi_application
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request # <-- Added Request here
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Depends, Header
 from fastapi.middleware.wsgi import WSGIMiddleware
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, Field
 from typing import List, Optional
 from django.db import transaction
 from fastapi.staticfiles import StaticFiles
@@ -20,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 django_app = get_wsgi_application()
 
 # 3. Import models AFTER Django is set up
-from inventory.models import Medicine, Category, Order, OrderItem
+from inventory.models import Medicine, Category, Order, OrderItem, Review
 
 # 4. Create the FastAPI app
 app = FastAPI(title="Medicine Delivery API")
@@ -35,7 +37,6 @@ class CategorySchema(BaseModel):
     name: str
     model_config = ConfigDict(from_attributes=True)
 
-
 class MedicineSchema(BaseModel):
     id: int
     name: str
@@ -43,6 +44,7 @@ class MedicineSchema(BaseModel):
     price: float
     stock: int
     image: Optional[str] = None
+    requires_prescription: bool = False
 
     @field_validator('image', mode='before')
     @classmethod
@@ -72,7 +74,7 @@ class OrderItemCreateSchema(BaseModel):
 class OrderCreateSchema(BaseModel):
     customer_name: str
     customer_email: str
-    prescription_image: Optional[str] = None # <-- NEW: Accept the image filename
+    prescription_image: Optional[str] = None
     items: List[OrderItemCreateSchema]
 
 class OrderResponseSchema(BaseModel):
@@ -81,7 +83,6 @@ class OrderResponseSchema(BaseModel):
     status: str
     message: str
 
-# --- SCHEMAS FOR VIEWING ORDERS ---
 class OrderMedicineSchema(BaseModel):
     name: str
     model_config = ConfigDict(from_attributes=True)
@@ -97,11 +98,10 @@ class OrderDetailSchema(BaseModel):
     customer_name: str
     customer_email: str
     status: str
-    prescription_image: Optional[str] = None # <-- NEW: Expose image on fetching
+    prescription_image: Optional[str] = None
     items: List[OrderItemDetailSchema]
     model_config = ConfigDict(from_attributes=True)
 
-# --- SCHEMAS FOR AUTHENTICATION ---
 class UserRegisterSchema(BaseModel):
     name: str
     email: str
@@ -116,17 +116,21 @@ class ReviewSchema(BaseModel):
     customer_name: str
     rating: int
     comment: Optional[str] = None
-
     model_config = ConfigDict(from_attributes=True)
 
 class ReviewCreateSchema(BaseModel):
     customer_name: str
-    rating: int
+    # Enforce rating between 1 and 5
+    rating: int = Field(..., ge=1, le=5)
     comment: Optional[str] = None
 
 # ==========================================
 # 6. DEFINE ROUTES
 # ==========================================
+@app.get("/api/categories")
+def get_categories():
+    return list(Category.objects.all().values('id', 'name'))
+
 @app.get("/api/medicines", response_model=List[MedicineSchema])
 def get_medicines(category_id: Optional[int] = None, search: Optional[str] = None):
     medicines = Medicine.objects.select_related('category').all()
@@ -180,7 +184,6 @@ def delete_medicine(medicine_id: int):
     medicine.delete()
     return {"message": f"Medicine with ID {medicine_id} has been successfully deleted."}
 
-# --- NEW: PRESCRIPTION UPLOAD ROUTE ---
 @app.post("/api/upload-prescription")
 def upload_prescription(file: UploadFile = File(...)):
     file_location = f"media/prescriptions/{file.filename}"
@@ -188,17 +191,20 @@ def upload_prescription(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
     return {"filename": file.filename}
 
+
 @app.post("/api/orders", response_model=OrderResponseSchema)
 def checkout(order_in: OrderCreateSchema):
     try:
         with transaction.atomic():
-            # Update to include prescription image
+            # 1. Create the order FIRST (without the total price yet)
             order = Order.objects.create(
                 customer_name=order_in.customer_name,
                 customer_email=order_in.customer_email,
                 status='PENDING',
                 prescription_image=order_in.prescription_image
             )
+
+            total_order_price = 0  # <-- Keep a running tally
 
             for item in order_in.items:
                 medicine = Medicine.objects.get(id=item.medicine_id)
@@ -207,6 +213,9 @@ def checkout(order_in: OrderCreateSchema):
                         status_code=400,
                         detail=f"Not enough stock for {medicine.name}. Only {medicine.stock} left."
                     )
+
+                # 2. Add to the running tally
+                total_order_price += (medicine.price * item.quantity)
 
                 OrderItem.objects.create(
                     order=order,
@@ -217,6 +226,10 @@ def checkout(order_in: OrderCreateSchema):
 
                 medicine.stock -= item.quantity
                 medicine.save()
+
+            # 3. Update the order with the final total price!
+            order.total_price = total_order_price
+            order.save()
 
             return {
                 "id": order.id,
@@ -236,6 +249,10 @@ def get_order(order_id: int):
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found")
 
+@app.get("/api/my-orders", response_model=List[OrderDetailSchema])
+def get_my_orders(email: str):
+    orders = Order.objects.filter(customer_email=email).prefetch_related('items__medicine')
+    return list(orders)
 
 # --- AUTHENTICATION ROUTES ---
 @app.post("/api/register")
@@ -265,23 +282,30 @@ def login_user(user_data: UserLoginSchema):
     else:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-@app.get("/api/my-orders")
-def get_my_orders(email: str):
-    orders = Order.objects.filter(customer_email=email).prefetch_related('items__medicine')
-    return list(orders)
 
-# --- ADMIN ROUTE ---
-@app.get("/api/admin/orders")
+# ==========================================
+# --- ADMIN SECURITY ---
+# ==========================================
+# Read the secret key from the environment variables
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me-in-production")
+
+def verify_admin(x_admin_key: str = Header(...)):
+    # Securely compare the provided header with your secret key
+    if not secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Unauthorized. Invalid Admin Key.")
+    return x_admin_key
+
+@app.get("/api/admin/orders", response_model=List[OrderDetailSchema], dependencies=[Depends(verify_admin)])
 def get_all_orders():
     return list(Order.objects.prefetch_related('items__medicine').all())
 
-# --- STATUS UPDATE ROUTE ---
-@app.put("/api/admin/orders/{order_id}")
+@app.put("/api/admin/orders/{order_id}", dependencies=[Depends(verify_admin)])
 def update_order_status(order_id: int, status: str):
     order = Order.objects.get(id=order_id)
     order.status = status
     order.save()
     return {"message": "Status updated"}
+# ==========================================
 
 @app.get("/api/me")
 def get_current_user(request: Request):
@@ -289,12 +313,9 @@ def get_current_user(request: Request):
     if user.is_authenticated:
         return {"name": user.first_name, "email": user.email}
     raise HTTPException(status_code=401, detail="Not logged in")
-# Don't forget to import Review at the top of your file alongside Medicine and Order!
-# from inventory.models import Medicine, Category, Order, OrderItem, Review
 
 @app.get("/api/medicines/{medicine_id}/reviews", response_model=List[ReviewSchema])
 def get_reviews(medicine_id: int):
-    # Fetch reviews for a specific medicine, newest first
     reviews = Review.objects.filter(medicine_id=medicine_id).order_by('-created_at')
     return list(reviews)
 
@@ -312,10 +333,7 @@ def create_review(medicine_id: int, review_in: ReviewCreateSchema):
         comment=review_in.comment
     )
     return review
-@app.get("/api/categories")
-def get_categories():
-    # Fetch all categories to display as filters in the frontend
-    return list(Category.objects.all().values('id', 'name'))
+
 
 # 7. Mount Django at the end
 if os.path.exists("media"):

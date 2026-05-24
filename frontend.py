@@ -1,8 +1,13 @@
 # frontend.py
+import os
 import streamlit as st
 import requests
 
 API_URL = "http://127.0.0.1:8000/api"
+
+# Define the secret header for Admin actions
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me-in-production")
+ADMIN_HEADERS = {"x-admin-key": ADMIN_API_KEY}
 
 st.set_page_config(page_title="Medicine Delivery", page_icon="💊", layout="wide")
 
@@ -29,20 +34,22 @@ if "email" in query_params and "name" in query_params:
 if st.session_state.show_profile and st.session_state.user:
     st.title("📜 Your Order History")
     email = st.session_state.user['email']
-    orders_resp = requests.get(f"{API_URL}/my-orders?email={email}")
 
-    if orders_resp.status_code == 200:
-        orders = orders_resp.json()
-        if not orders:
-            st.write("You haven't placed any orders yet.")
-        else:
-            for order in orders:
-                with st.expander(f"Order #{order['id']} - Status: {order['status']}"):
-                    # Show prescription if it exists
-                    if order.get('prescription_image'):
-                        st.info("📄 Prescription attached to this order.")
-                    for item in order['items']:
-                        st.write(f"- {item['medicine']['name']} (Qty: {item['quantity']})")
+    try:
+        orders_resp = requests.get(f"{API_URL}/my-orders?email={email}", timeout=10)
+        if orders_resp.status_code == 200:
+            orders = orders_resp.json()
+            if not orders:
+                st.write("You haven't placed any orders yet.")
+            else:
+                for order in orders:
+                    with st.expander(f"Order #{order['id']} - Status: {order['status']}"):
+                        if order.get('prescription_image'):
+                            st.info("📄 Prescription attached to this order.")
+                        for item in order['items']:
+                            st.write(f"- {item['medicine']['name']} (Qty: {item['quantity']})")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not load orders. Backend might be asleep. Error: {e}")
 
     if st.button("⬅️ Back to Store"):
         st.session_state.show_profile = False
@@ -54,23 +61,31 @@ if st.session_state.show_profile and st.session_state.user:
 # ==========================================
 if st.session_state.get('show_admin'):
     st.title("⚙️ Admin Control Panel")
-    orders_resp = requests.get(f"{API_URL}/admin/orders")
-    if orders_resp.status_code == 200:
-        for order in orders_resp.json():
-            with st.container():
-                st.write(f"**Order #{order['id']}** | Customer: {order['customer_name']} | Status: {order['status']}")
 
-                # Show link to prescription if it exists
-                if order.get('prescription_image'):
-                    st.markdown(
-                        f"[📄 View Prescription](http://127.0.0.1:8000/media/prescriptions/{order['prescription_image']})")
+    try:
+        orders_resp = requests.get(f"{API_URL}/admin/orders", headers=ADMIN_HEADERS, timeout=10)
+        if orders_resp.status_code == 200:
+            for order in orders_resp.json():
+                with st.container():
+                    st.write(
+                        f"**Order #{order['id']}** | Customer: {order['customer_name']} | Status: {order['status']}")
 
-                new_status = st.selectbox("Update Status", ['PENDING', 'PAID', 'SHIPPED', 'DELIVERED'],
-                                          key=f"sel_{order['id']}")
-                if st.button("Update Status", key=f"btn_{order['id']}"):
-                    requests.put(f"{API_URL}/admin/orders/{order['id']}?status={new_status}")
-                    st.rerun()
-                st.divider()
+                    if order.get('prescription_image'):
+                        st.markdown(
+                            f"[📄 View Prescription](http://127.0.0.1:8000/media/prescriptions/{order['prescription_image']})")
+
+                    new_status = st.selectbox("Update Status", ['PENDING', 'PAID', 'SHIPPED', 'DELIVERED'],
+                                              key=f"sel_{order['id']}")
+                    if st.button("Update Status", key=f"btn_{order['id']}"):
+                        requests.put(f"{API_URL}/admin/orders/{order['id']}?status={new_status}", headers=ADMIN_HEADERS,
+                                     timeout=10)
+                        st.rerun()
+                    st.divider()
+        else:
+            st.error("Unauthorized to view admin dashboard.")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not connect to backend. Error: {e}")
+
     if st.button("⬅️ Back to Store"):
         st.session_state.show_admin = False
         st.rerun()
@@ -88,39 +103,51 @@ st.divider()
 # ==========================================
 st.sidebar.header("👤 User Account")
 
-# --- AUTH LOGIC ---
 if not st.session_state.user:
-    auth_tab = st.sidebar.radio("Navigation", ["Login", "Register"])
-
     st.sidebar.markdown("""
         <a href="http://127.0.0.1:8000/login/google-oauth2/" target="_blank">
-            <button style="width: 100%; cursor: pointer;">Login with Google</button>
+            <button style="width: 100%; cursor: pointer;">Continue with Google</button>
         </a>
     """, unsafe_allow_html=True)
-    st.sidebar.divider()
 
-    name = st.sidebar.text_input("Name (for Register)") if auth_tab == "Register" else ""
+    st.sidebar.divider()
+    st.sidebar.markdown("**Or use Email & Password**")
+
     email = st.sidebar.text_input("Email")
     password = st.sidebar.text_input("Password", type="password")
 
-    if st.sidebar.button(auth_tab):
-        endpoint = "/register" if auth_tab == "Register" else "/login"
-        payload = {"name": name, "email": email, "password": password}
-        resp = requests.post(f"{API_URL}{endpoint}", json=payload)
-        if resp.status_code in [200, 201]:
-            st.session_state.user = resp.json()
-            st.rerun()
+    if st.sidebar.button("Continue"):
+        if not email or not password:
+            st.sidebar.warning("Please enter both email and password.")
         else:
-            st.sidebar.error("Authentication failed.")
+            try:
+                login_payload = {"email": email, "password": password}
+                login_resp = requests.post(f"{API_URL}/login", json=login_payload, timeout=10)
+
+                if login_resp.status_code == 200:
+                    st.session_state.user = login_resp.json()
+                    st.rerun()
+                else:
+                    default_name = email.split('@')[0].capitalize()
+                    reg_payload = {"name": default_name, "email": email, "password": password}
+                    reg_resp = requests.post(f"{API_URL}/register", json=reg_payload, timeout=10)
+
+                    if reg_resp.status_code in [200, 201]:
+                        st.session_state.user = {"name": default_name, "email": email}
+                        st.rerun()
+                    else:
+                        st.sidebar.error("⚠️ Incorrect password.")
+            except requests.exceptions.RequestException as e:
+                st.sidebar.error(f"Connection error: {e}")
 else:
-    st.sidebar.write(f"Logged in as: **{st.session_state.user['name']}**")
+    display_name = st.session_state.user.get('name', 'User')
+    st.sidebar.write(f"Logged in as: **{display_name}**")
 
     if st.sidebar.button("View My Orders"): st.session_state.show_profile = True; st.rerun()
     if st.session_state.user.get('email') == "admin@pharmacy.com":
         if st.sidebar.button("⚙️ Admin Dashboard"): st.session_state.show_admin = True; st.rerun()
     if st.sidebar.button("Logout"): st.session_state.user = None; st.rerun()
 
-# --- CART & PRESCRIPTION LOGIC ---
 # --- CART & PRESCRIPTION LOGIC ---
 st.sidebar.divider()
 st.sidebar.header("🛒 Your Shopping Cart")
@@ -130,7 +157,6 @@ else:
     total_price = 0.0
     for item in st.session_state.cart:
         total_price += (item['quantity'] * item['price'])
-        # Add an indicator if the item requires a prescription
         rx_badge = " *(Rx Required)*" if item.get('requires_rx') else ""
         st.sidebar.write(
             f"- **{item['quantity']}x** {item['name']}{rx_badge} (*${(item['quantity'] * item['price']):.2f}*)")
@@ -141,16 +167,12 @@ else:
     st.sidebar.divider()
     st.sidebar.subheader("Checkout Details")
     customer_name = st.sidebar.text_input("Checkout Name",
-                                          value=st.session_state.user['name'] if st.session_state.user else "")
-    customer_email = st.sidebar.text_input("Checkout Email",
-                                           value=st.session_state.user['email'] if st.session_state.user else "")
+                                          value=st.session_state.user.get('name', '') if st.session_state.user else "")
+    customer_email = st.sidebar.text_input("Checkout Email", value=st.session_state.user.get('email',
+                                                                                             '') if st.session_state.user else "")
 
-    # ==========================================
-    # --- NEW: PAYMENT METHOD UI ---
-    # ==========================================
     payment_method = st.sidebar.selectbox("Payment Method", ["💵 Cash on Delivery (COD)", "💳 Credit Card (Coming Soon)"])
 
-    # --- PRESCRIPTION UPLOAD CHECK ---
     needs_rx = any(item.get('requires_rx', False) for item in st.session_state.cart)
     uploaded_file = None
 
@@ -158,102 +180,60 @@ else:
         st.sidebar.warning("⚠️ A doctor's prescription is required for one or more items in your cart.")
         uploaded_file = st.sidebar.file_uploader("Upload Prescription (Image)", type=['jpg', 'png', 'jpeg'])
 
-    # --- CHECKOUT VALIDATION ---
     if payment_method == "💳 Credit Card (Coming Soon)":
         st.sidebar.info("Online payments are currently disabled. Please select Cash on Delivery.")
     elif not needs_rx or uploaded_file is not None:
-
         st.sidebar.info("🚚 You will pay the delivery agent when your order arrives.")
 
-        # Changed button text to be explicit about COD
         if st.sidebar.button("Confirm COD Order", type="primary"):
             rx_filename = None
 
-            # 1. Upload file to backend if it exists
-            if uploaded_file is not None:
-                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                upload_resp = requests.post(f"{API_URL}/upload-prescription", files=files)
-                if upload_resp.status_code == 200:
-                    rx_filename = upload_resp.json()["filename"]
+            try:
+                if uploaded_file is not None:
+                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+                    upload_resp = requests.post(f"{API_URL}/upload-prescription", files=files, timeout=15)
+                    if upload_resp.status_code == 200:
+                        rx_filename = upload_resp.json()["filename"]
 
-            # 2. Complete Checkout
-            payload = {
-                "customer_name": customer_name,
-                "customer_email": customer_email,
-                "prescription_image": rx_filename,
-                "items": [{"medicine_id": i["medicine_id"], "quantity": i["quantity"]} for i in st.session_state.cart]
-            }
+                payload = {
+                    "customer_name": customer_name,
+                    "customer_email": customer_email,
+                    "prescription_image": rx_filename,
+                    "items": [{"medicine_id": i["medicine_id"], "quantity": i["quantity"]} for i in
+                              st.session_state.cart]
+                }
 
-            if requests.post(f"{API_URL}/orders", json=payload).status_code == 200:
-                st.sidebar.success("🎉 Order Placed! Please keep exact change ready for delivery.")
-                st.session_state.cart = []
-                st.rerun()
+                if requests.post(f"{API_URL}/orders", json=payload, timeout=10).status_code == 200:
+                    st.sidebar.success("🎉 Order Placed! Please keep exact change ready for delivery.")
+                    st.session_state.cart = []
+                    st.rerun()
+            except requests.exceptions.RequestException as e:
+                st.sidebar.error(f"Checkout failed: {e}")
 
-    # --- PRESCRIPTION UPLOAD CHECK ---
-    needs_rx = any(item.get('requires_rx', False) for item in st.session_state.cart)
-    uploaded_file = None
-
-    if needs_rx:
-        st.sidebar.warning("⚠️ A doctor's prescription is required for one or more items in your cart.")
-        uploaded_file = st.sidebar.file_uploader("Upload Prescription (Image)", type=['jpg', 'png', 'jpeg'])
-
-    # Only show checkout button if they don't need an Rx, OR if they need one and uploaded it
-    if not needs_rx or uploaded_file is not None:
-        if st.sidebar.button("Complete Order", type="primary"):
-            rx_filename = None
-
-            # 1. Upload file to backend if it exists
-            if uploaded_file is not None:
-                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                upload_resp = requests.post(f"{API_URL}/upload-prescription", files=files)
-                if upload_resp.status_code == 200:
-                    rx_filename = upload_resp.json()["filename"]
-
-            # 2. Complete Checkout
-            payload = {
-                "customer_name": customer_name,
-                "customer_email": customer_email,
-                "prescription_image": rx_filename,
-                "items": [{"medicine_id": i["medicine_id"], "quantity": i["quantity"]} for i in st.session_state.cart]
-            }
-
-            if requests.post(f"{API_URL}/orders", json=payload).status_code == 200:
-                st.sidebar.success("Order Placed Successfully!")
-                st.session_state.cart = []
-                st.rerun()
-
-# ==========================================
-# 6. MEDICINE SEARCH & DISPLAY
-# ==========================================
 # ==========================================
 # 6. MEDICINE SEARCH, FILTER & DISPLAY
 # ==========================================
 st.subheader("Available Medicines")
 
-# --- SEARCH, FILTER & SORT CONTROLS ---
-# Create a layout with 3 columns for our catalog controls
 ctrl_cols = st.columns([2, 1, 1])
 
 with ctrl_cols[0]:
     search_query = st.text_input("🔍 Search by name...", "")
 
-# Fetch categories from backend for the dropdown filter
 category_id = None
 try:
-    cat_response = requests.get(f"{API_URL}/categories")
+    cat_response = requests.get(f"{API_URL}/categories", timeout=10)
     if cat_response.status_code == 200:
         categories_data = cat_response.json()
-        # Create a clean list of category names for the select box
         cat_options = ["All Categories"] + [cat['name'] for cat in categories_data]
 
         with ctrl_cols[1]:
             selected_cat = st.selectbox("🏷️ Filter by Category", cat_options)
 
         if selected_cat != "All Categories":
-            # Map the selected name back to its database ID
             category_id = next(cat['id'] for cat in categories_data if cat['name'] == selected_cat)
-except:
-    st.warning("Could not load categories layout.")
+except requests.exceptions.RequestException as e:
+    st.warning(f"Could not load categories: {e}")
 
 with ctrl_cols[2]:
     sort_option = st.selectbox("📊 Sort By Price", ["Default", "Price: Low to High", "Price: High to Low"])
@@ -262,7 +242,6 @@ st.divider()
 
 # --- FETCH & DISPLAY LOGIC ---
 try:
-    # 1. Build the API request URL with filters
     request_url = f"{API_URL}/medicines"
     params = {}
     if search_query:
@@ -270,18 +249,16 @@ try:
     if category_id is not None:
         params["category_id"] = category_id
 
-    response = requests.get(request_url, params=params)
+    response = requests.get(request_url, params=params, timeout=10)
 
     if response.status_code == 200:
         medicines = response.json()
 
-        # 2. Apply frontend sorting based on the user's choice
         if sort_option == "Price: Low to High":
             medicines = sorted(medicines, key=lambda x: float(x['price']))
         elif sort_option == "Price: High to Low":
             medicines = sorted(medicines, key=lambda x: float(x['price']), reverse=True)
 
-        # 3. Render the processed items into a grid
         if not medicines:
             st.info("No medicines found matching the selected criteria.")
         else:
@@ -299,7 +276,6 @@ try:
                     st.markdown(f"### {med['name']}")
                     st.write(f"**Price:** ${med['price']}")
 
-                    # --- INVENTORY ALERT LOGIC ---
                     stock = med.get('stock', 0)
 
                     if stock == 0:
@@ -321,7 +297,7 @@ try:
                                     item_found = True
                                     break
 
-                            if not not item_found == False:
+                            if not item_found:
                                 st.session_state.cart.append({
                                     "medicine_id": med['id'],
                                     "name": med['name'],
@@ -331,9 +307,8 @@ try:
                                 })
                                 st.success(f"Added {med['name']}!")
 
-                    # --- REVIEWS SECTION ---
                     with st.expander(f"⭐ Reviews & Ratings"):
-                        rev_resp = requests.get(f"{API_URL}/medicines/{med['id']}/reviews")
+                        rev_resp = requests.get(f"{API_URL}/medicines/{med['id']}/reviews", timeout=10)
                         if rev_resp.status_code == 200:
                             reviews = rev_resp.json()
                             if not reviews:
@@ -354,14 +329,14 @@ try:
 
                                 if submit_review:
                                     payload = {
-                                        "customer_name": st.session_state.user['name'],
+                                        "customer_name": st.session_state.user.get('name', 'User'),
                                         "rating": rating,
                                         "comment": comment
                                     }
-                                    requests.post(f"{API_URL}/medicines/{med['id']}/reviews", json=payload)
+                                    requests.post(f"{API_URL}/medicines/{med['id']}/reviews", json=payload, timeout=10)
                                     st.success("Review submitted! Thank you.")
                                     st.rerun()
                         else:
                             st.info("Please log in to leave a review.")
-except Exception as e:
-    st.error("Backend not running.")
+except requests.exceptions.RequestException as e:
+    st.error(f"Backend not running or timed out. Error: {e}")
