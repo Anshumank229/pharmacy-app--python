@@ -12,11 +12,10 @@ API_URL = "http://127.0.0.1:8000/api"
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me-in-production")
 ADMIN_HEADERS = {"x-admin-key": ADMIN_API_KEY}
 ADMIN_EMAIL = "kumaranshuman500@gmail.com"
-WHATSAPP_NUMBER = "91XXXXXXXXXX"  # Replace with your actual number (country code + number, no +)
+WHATSAPP_NUMBER = "91XXXXXXXXXX"  # Replace with your actual number
 
 st.set_page_config(page_title="Medicine Delivery", page_icon="💊", layout="wide")
 
-# Mobile-friendly CSS
 st.markdown("""
 <style>
   @media (max-width: 768px) {
@@ -34,6 +33,9 @@ st.markdown("""
 defaults = {
     'show_profile': False,
     'show_admin': False,
+    'show_analytics': False,
+    'show_medicine_detail': False,
+    'selected_medicine_id': None,
     'cart': [],
     'user': None,
     'last_area_name': '',
@@ -51,7 +53,6 @@ query_params = st.query_params
 if "email" in query_params and "name" in query_params:
     email_from_google = query_params["email"]
     name_from_google = query_params["name"]
-    # Check role from backend — don't trust frontend-only email matching
     try:
         role_resp = requests.get(f"{API_URL}/me", params={"email": email_from_google}, timeout=5)
         is_admin = role_resp.json().get("is_admin", False) if role_resp.ok else False
@@ -103,7 +104,137 @@ def delivery_estimate(created_at_str: str) -> str:
 
 
 # ==========================================
-# 4. PROFILE PAGE
+# 4. MEDICINE DETAIL PAGE
+# ==========================================
+if st.session_state.show_medicine_detail and st.session_state.selected_medicine_id:
+    med_id = st.session_state.selected_medicine_id
+    try:
+        med_resp = requests.get(f"{API_URL}/medicines/{med_id}", timeout=10)
+        if med_resp.status_code == 200:
+            med = med_resp.json()
+
+            if st.button("← Back to store"):
+                st.session_state.show_medicine_detail = False
+                st.session_state.selected_medicine_id = None
+                st.rerun()
+
+            st.title(med['name'])
+            if med.get('brand'):
+                st.caption(f"Brand: {med['brand']}")
+
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                if med.get('image'):
+                    st.image(f"http://127.0.0.1:8000/media/{med['image']}", use_container_width=True)
+                else:
+                    st.info("No image available")
+
+            with col2:
+                if med.get('requires_prescription'):
+                    st.warning("⚕️ Prescription required")
+
+                st.markdown(f"### ₹{med['price']}")
+
+                stock = med.get('stock', 0)
+                if stock == 0:
+                    st.error("Out of stock")
+                elif stock <= 5:
+                    st.warning(f"Only {stock} left in stock!")
+                else:
+                    st.success(f"In stock ({stock} available)")
+
+                details = []
+                if med.get('dosage_form'):
+                    details.append(f"**Form:** {med['dosage_form']}")
+                if med.get('strength'):
+                    details.append(f"**Strength:** {med['strength']}")
+                if med.get('category'):
+                    details.append(f"**Category:** {med['category']['name']}")
+                for d in details:
+                    st.markdown(d)
+
+                if med.get('description'):
+                    st.divider()
+                    st.markdown("**About this medicine**")
+                    st.write(med['description'])
+
+                if stock > 0:
+                    if st.button("Add to cart", type="primary", use_container_width=True):
+                        item_found = False
+                        for cart_item in st.session_state.cart:
+                            if cart_item["medicine_id"] == med['id']:
+                                if cart_item["quantity"] < stock:
+                                    cart_item["quantity"] += 1
+                                    st.success(f"Added another {med['name']}!")
+                                else:
+                                    st.error(f"Only {stock} in stock!")
+                                item_found = True
+                                break
+                        if not item_found:
+                            st.session_state.cart.append({
+                                "medicine_id": med['id'],
+                                "name":        med['name'],
+                                "quantity":    1,
+                                "price":       float(med['price']),
+                                "requires_rx": med.get('requires_prescription', False),
+                            })
+                            st.success(f"Added {med['name']} to cart!")
+
+            st.divider()
+            st.subheader("Reviews & ratings")
+
+            try:
+                rev_resp = requests.get(f"{API_URL}/medicines/{med_id}/reviews", timeout=10)
+                if rev_resp.status_code == 200:
+                    reviews = rev_resp.json()
+                    if not reviews:
+                        st.info("No reviews yet. Be the first!")
+                    else:
+                        avg = sum(r['rating'] for r in reviews) / len(reviews)
+                        st.markdown(f"**Average rating: {'⭐' * round(avg)} ({avg:.1f}/5 from {len(reviews)} reviews)**")
+                        st.divider()
+                        for r in reviews:
+                            st.markdown(f"**{r['customer_name']}** {'⭐' * r['rating']}")
+                            if r['comment']:
+                                st.write(f"*{r['comment']}*")
+                            st.divider()
+            except requests.exceptions.RequestException:
+                st.warning("Could not load reviews.")
+
+            if st.session_state.user:
+                st.subheader("Leave a review")
+                with st.form(key=f"detail_review_{med_id}"):
+                    rating  = st.slider("Rating", 1, 5, 5)
+                    comment = st.text_area("Your experience (optional)")
+                    if st.form_submit_button("Submit review"):
+                        try:
+                            requests.post(
+                                f"{API_URL}/medicines/{med_id}/reviews",
+                                json={
+                                    "customer_name": st.session_state.user.get('name', 'User'),
+                                    "rating": rating,
+                                    "comment": comment,
+                                },
+                                timeout=10,
+                            )
+                            st.success("Review submitted!")
+                            st.rerun()
+                        except requests.exceptions.RequestException as e:
+                            st.error(f"Could not submit: {e}")
+            else:
+                st.info("Log in to leave a review.")
+        else:
+            st.error("Medicine not found.")
+            if st.button("Back to store"):
+                st.session_state.show_medicine_detail = False
+                st.rerun()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not load medicine: {e}")
+    st.stop()
+
+
+# ==========================================
+# 5. PROFILE PAGE
 # ==========================================
 if st.session_state.show_profile and st.session_state.user:
     st.title("Your Profile & Orders")
@@ -140,8 +271,8 @@ if st.session_state.show_profile and st.session_state.user:
             st.error(f"Could not save: {e}")
 
     st.divider()
-
     st.subheader("Your order history")
+
     try:
         orders_resp = requests.get(
             f"{API_URL}/my-orders",
@@ -160,8 +291,7 @@ if st.session_state.show_profile and st.session_state.user:
                         'DELIVERED': '✅', 'CANCELLED': '❌'
                     }.get(status, '📦')
 
-                    label = f"Order #{order['id']} — {status_emoji} {status}"
-                    with st.expander(label):
+                    with st.expander(f"Order #{order['id']} — {status_emoji} {status}"):
                         col1, col2 = st.columns(2)
                         with col1:
                             st.write(f"📍 **Address:** {order.get('delivery_address', '—')}")
@@ -187,6 +317,10 @@ if st.session_state.show_profile and st.session_state.user:
                                 f"- {item['medicine']['name']} × {item['quantity']} "
                                 f"(₹{item['price_at_time_of_purchase']} each)"
                             )
+
+                        # PDF Invoice download
+                        invoice_url = f"{API_URL}/orders/{order['id']}/invoice?email={u['email']}"
+                        st.markdown(f"[📄 Download Invoice PDF]({invoice_url})")
 
                         if status == 'PENDING':
                             if st.button("Cancel order", key=f"cancel_{order['id']}"):
@@ -214,10 +348,119 @@ if st.session_state.show_profile and st.session_state.user:
 
 
 # ==========================================
-# 5. ADMIN DASHBOARD
+# 6. ANALYTICS PAGE
+# ==========================================
+if st.session_state.get('show_analytics'):
+    st.title("Analytics")
+
+    try:
+        resp = requests.get(f"{API_URL}/admin/analytics", headers=ADMIN_HEADERS, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            summary = data['summary']
+
+            # Summary metrics
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Total Revenue", f"₹{summary['total_revenue']:.0f}")
+            c2.metric("Total Orders", summary['total_orders'])
+            c3.metric("Delivered", summary['delivered'])
+            c4.metric("Cancelled", summary['cancelled'])
+            c5.metric("Delivery Rate", f"{summary['delivery_rate']}%")
+
+            st.divider()
+
+            # Revenue chart
+            if data['daily_revenue']:
+                st.subheader("Revenue — last 30 days")
+                import pandas as pd
+                df = pd.DataFrame(data['daily_revenue'])
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date')
+                st.bar_chart(df['revenue'])
+
+                st.subheader("Orders per day — last 30 days")
+                st.line_chart(df['orders'])
+            else:
+                st.info("No order data yet for the last 30 days.")
+
+            st.divider()
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Top medicines sold")
+                if data['top_medicines']:
+                    import pandas as pd
+                    df_med = pd.DataFrame(data['top_medicines'])
+                    df_med = df_med.rename(columns={'name': 'Medicine', 'qty_sold': 'Qty Sold', 'revenue': 'Revenue (₹)'})
+                    df_med['Revenue (₹)'] = df_med['Revenue (₹)'].apply(lambda x: f"₹{x:.2f}")
+                    st.dataframe(df_med, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No sales data yet.")
+
+            with col2:
+                st.subheader("Orders by pincode")
+                if data['by_pincode']:
+                    import pandas as pd
+                    df_pin = pd.DataFrame(data['by_pincode'])
+                    df_pin = df_pin.rename(columns={'pincode': 'Pincode', 'orders': 'Orders'})
+                    st.dataframe(df_pin, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No pincode data yet.")
+
+            st.divider()
+            st.subheader("Order status breakdown")
+            if data['status_breakdown']:
+                import pandas as pd
+                df_status = pd.DataFrame(
+                    list(data['status_breakdown'].items()),
+                    columns=['Status', 'Count']
+                )
+                st.bar_chart(df_status.set_index('Status'))
+
+        else:
+            st.error("Unauthorized.")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not load analytics: {e}")
+
+    if st.button("Back to admin"):
+        st.session_state.show_analytics = False
+        st.session_state.show_admin = True
+        st.rerun()
+    st.stop()
+
+
+# ==========================================
+# 7. ADMIN DASHBOARD
 # ==========================================
 if st.session_state.get('show_admin'):
     st.title("Admin control panel")
+
+    # Analytics and batch alert buttons
+    btn_cols = st.columns(3)
+    with btn_cols[0]:
+        if st.button("📊 View analytics", use_container_width=True):
+            st.session_state.show_admin = False
+            st.session_state.show_analytics = True
+            st.rerun()
+
+    # Batch expiry alerts
+    try:
+        batch_resp = requests.get(f"{API_URL}/admin/batches/alerts", headers=ADMIN_HEADERS, timeout=10)
+        if batch_resp.status_code == 200:
+            alerts = batch_resp.json()
+            expired = alerts.get('expired', [])
+            expiring = alerts.get('expiring_soon', [])
+            if expired:
+                st.error(f"🔴 {len(expired)} expired batch(es) — remove from stock immediately!")
+                for b in expired:
+                    st.caption(f"  {b['medicine']} | Batch {b['batch']} | Qty: {b['quantity']} | Expired {b['days_ago']} days ago")
+            if expiring:
+                st.warning(f"🟡 {len(expiring)} batch(es) expiring within 30 days")
+                for b in expiring:
+                    st.caption(f"  {b['medicine']} | Batch {b['batch']} | Qty: {b['quantity']} | {b['days_left']} days left")
+    except requests.exceptions.RequestException:
+        pass
 
     try:
         orders_resp = requests.get(
@@ -226,14 +469,12 @@ if st.session_state.get('show_admin'):
         if orders_resp.status_code == 200:
             all_orders = orders_resp.json()
 
-            # New order alert — compare pending count with last refresh
             current_pending = sum(1 for o in all_orders if o['status'] == 'PENDING')
             if current_pending > st.session_state.last_pending_count:
                 new_count = current_pending - st.session_state.last_pending_count
                 st.error(f"🔔 {new_count} new order(s) arrived!")
             st.session_state.last_pending_count = current_pending
 
-            # Today's summary
             today_str = datetime.now().date().isoformat()
             todays = [o for o in all_orders if (o.get('created_at') or '').startswith(today_str)]
             pending_today   = sum(1 for o in todays if o['status'] == 'PENDING')
@@ -248,7 +489,8 @@ if st.session_state.get('show_admin'):
 
             # Low stock alert
             try:
-                low = Medicine.objects.filter(stock__lte=5).values('name', 'stock')
+                from inventory.models import Medicine as Med
+                low = Med.objects.filter(stock__lte=5).values('name', 'stock')
                 if low:
                     names = ", ".join(f"{m['name']} ({m['stock']} left)" for m in low)
                     st.warning(f"⚠️ Low stock: {names}")
@@ -275,6 +517,8 @@ if st.session_state.get('show_admin'):
                             st.markdown(
                                 f"[📄 View prescription](http://127.0.0.1:8000/api/prescriptions/{order['prescription_image']})",
                             )
+                        # Admin invoice download
+                        st.markdown(f"[🧾 Download invoice]({API_URL}/orders/{order['id']}/invoice?email={order['customer_email']})")
                     with c2:
                         st.write(f"Status: **{order['status']}**")
                         new_status = st.selectbox(
@@ -295,7 +539,6 @@ if st.session_state.get('show_admin'):
                             except requests.exceptions.RequestException as e:
                                 st.error(f"Update failed: {e}")
                     st.divider()
-
         else:
             st.error("Unauthorized — check your ADMIN_API_KEY.")
     except requests.exceptions.RequestException as e:
@@ -305,16 +548,14 @@ if st.session_state.get('show_admin'):
         st.session_state.show_admin = False
         st.rerun()
 
-    # Auto-refresh AFTER content is rendered — was incorrectly placed before content
     st.caption("Auto-refreshing every 60 seconds…")
     time.sleep(60)
     st.rerun()
-
     st.stop()
 
 
 # ==========================================
-# 6. MAIN STOREFRONT
+# 8. MAIN STOREFRONT
 # ==========================================
 st.title("💊 Your Local Pharmacy")
 st.write("Order now — delivered to your door within 24 hours. Pay on delivery.")
@@ -326,7 +567,7 @@ st.divider()
 
 
 # ==========================================
-# 7. SIDEBAR — AUTH
+# 9. SIDEBAR — AUTH
 # ==========================================
 st.sidebar.header("Your account")
 
@@ -365,7 +606,6 @@ if not st.session_state.user:
                 elif login_resp.status_code == 429:
                     st.sidebar.error("Too many login attempts. Please wait a minute.")
                 else:
-                    # Auto-register on first visit
                     default_name = email.split('@')[0].capitalize()
                     reg_resp = requests.post(
                         f"{API_URL}/register",
@@ -389,7 +629,6 @@ else:
     if st.sidebar.button("My profile & orders", use_container_width=True):
         st.session_state.show_profile = True
         st.rerun()
-    # Admin button shown only if backend confirmed is_admin — not just by email string
     if st.session_state.user.get('email') == ADMIN_EMAIL and st.session_state.user.get('is_admin'):
         if st.sidebar.button("Admin dashboard", use_container_width=True):
             st.session_state.show_admin = True
@@ -402,7 +641,7 @@ else:
 
 
 # ==========================================
-# 8. SIDEBAR — CART & CHECKOUT
+# 10. SIDEBAR — CART & CHECKOUT
 # ==========================================
 st.sidebar.divider()
 st.sidebar.header("Your cart")
@@ -432,7 +671,6 @@ else:
     customer_address = st.sidebar.text_area("Delivery address",  value=u.get('address', ''), placeholder="House no, street, landmark...")
     pincode          = st.sidebar.text_input("Pincode",          value=u.get('pincode', ''), placeholder="e.g. 800001", max_chars=10)
 
-    # Live pincode validation
     pincode_ok = False
     area_name  = None
 
@@ -454,7 +692,6 @@ else:
         else:
             st.sidebar.warning("Enter a valid 6-digit pincode.")
 
-    # Coupon code
     coupon_code = st.sidebar.text_input("Coupon code (optional)")
     discount_percent = 0
     if coupon_code:
@@ -471,7 +708,6 @@ else:
         except requests.exceptions.RequestException:
             st.sidebar.warning("Could not validate coupon. Try again.")
 
-    # Prescription upload if needed
     needs_rx      = any(i.get('requires_rx', False) for i in st.session_state.cart)
     uploaded_file = None
     if needs_rx:
@@ -519,16 +755,12 @@ else:
                 resp = requests.post(f"{API_URL}/orders", json=payload, timeout=10)
                 if resp.status_code == 200:
                     order = resp.json()
-                    msg = (
-                        f"✅ Order #{order['id']} placed! "
-                        f"Total: ₹{order['total_price']:.2f}"
-                    )
+                    msg = f"✅ Order #{order['id']} placed! Total: ₹{order['total_price']:.2f}"
                     if order.get('discount_applied'):
                         msg += f" ({order['discount_applied']}% coupon applied)"
                     msg += f". Expected within 24 hours. We'll call {customer_phone} before arrival."
                     st.sidebar.success(msg)
 
-                    # Save profile silently for next time
                     if st.session_state.user:
                         try:
                             requests.put(
@@ -561,7 +793,7 @@ else:
 
 
 # ==========================================
-# 9. MEDICINE SEARCH, FILTER & DISPLAY
+# 11. MEDICINE SEARCH, FILTER & DISPLAY
 # ==========================================
 st.subheader("Available medicines")
 ctrl_cols = st.columns([2, 1, 1, 1])
@@ -614,7 +846,7 @@ try:
                     if med.get('image'):
                         st.image(
                             f"http://127.0.0.1:8000/media/{med['image']}",
-                            use_container_width=True,   # fixed: use_column_width is deprecated
+                            use_container_width=True,
                         )
                     else:
                         st.info("No image")
@@ -632,28 +864,37 @@ try:
                     else:
                         if stock <= 5:
                             st.warning(f"Only {stock} left!")
-                        if st.button("Add to cart", key=f"med_{med['id']}", use_container_width=True):
-                            item_found = False
-                            for cart_item in st.session_state.cart:
-                                if cart_item["medicine_id"] == med['id']:
-                                    if cart_item["quantity"] < stock:
-                                        cart_item["quantity"] += 1
-                                        st.success(f"Added another {med['name']}!")
-                                    else:
-                                        st.error(f"Only {stock} in stock!")
-                                    item_found = True
-                                    break
-                            if not item_found:
-                                st.session_state.cart.append({
-                                    "medicine_id": med['id'],
-                                    "name":        med['name'],
-                                    "quantity":    1,
-                                    "price":       float(med['price']),
-                                    "requires_rx": med.get('requires_prescription', False),
-                                })
-                                st.success(f"Added {med['name']}!")
 
-                    with st.expander("Reviews & ratings"):
+                        btn_cols = st.columns(2)
+                        with btn_cols[0]:
+                            if st.button("Add to cart", key=f"med_{med['id']}", use_container_width=True):
+                                item_found = False
+                                for cart_item in st.session_state.cart:
+                                    if cart_item["medicine_id"] == med['id']:
+                                        if cart_item["quantity"] < stock:
+                                            cart_item["quantity"] += 1
+                                            st.success(f"Added another {med['name']}!")
+                                        else:
+                                            st.error(f"Only {stock} in stock!")
+                                        item_found = True
+                                        break
+                                if not item_found:
+                                    st.session_state.cart.append({
+                                        "medicine_id": med['id'],
+                                        "name":        med['name'],
+                                        "quantity":    1,
+                                        "price":       float(med['price']),
+                                        "requires_rx": med.get('requires_prescription', False),
+                                    })
+                                    st.success(f"Added {med['name']}!")
+
+                        with btn_cols[1]:
+                            if st.button("Details", key=f"det_{med['id']}", use_container_width=True):
+                                st.session_state.show_medicine_detail = True
+                                st.session_state.selected_medicine_id = med['id']
+                                st.rerun()
+
+                    with st.expander("Reviews"):
                         try:
                             rev_resp = requests.get(
                                 f"{API_URL}/medicines/{med['id']}/reviews", timeout=10
@@ -661,13 +902,14 @@ try:
                             if rev_resp.status_code == 200:
                                 reviews = rev_resp.json()
                                 if not reviews:
-                                    st.write("No reviews yet. Be the first!")
+                                    st.write("No reviews yet.")
                                 else:
-                                    for r in reviews:
+                                    avg = sum(r['rating'] for r in reviews) / len(reviews)
+                                    st.write(f"{'⭐' * round(avg)} ({avg:.1f})")
+                                    for r in reviews[:3]:
                                         st.markdown(f"**{r['customer_name']}** {'⭐' * r['rating']}")
                                         if r['comment']:
                                             st.write(f"*{r['comment']}*")
-                                        st.divider()
                         except requests.exceptions.RequestException:
                             st.warning("Could not load reviews.")
 

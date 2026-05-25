@@ -3,7 +3,8 @@ from django.contrib import admin
 from django.db.models import Count
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.models import User
-from .models import Category, Medicine, Order, OrderItem, Review, ServiceArea, UserProfile, Coupon
+from django.utils import timezone
+from .models import Category, Medicine, MedicineBatch, Order, OrderItem, Review, ServiceArea, UserProfile, Coupon
 
 
 # ==========================================
@@ -14,7 +15,6 @@ class CategoryAdmin(admin.ModelAdmin):
     list_display = ('name', 'medicine_count')
 
     def get_queryset(self, request):
-        # 'medicines' matches the related_name on the ForeignKey in Medicine
         return super().get_queryset(request).annotate(medicine_count=Count('medicines'))
 
     @admin.display(description='Total Medicines')
@@ -23,14 +23,73 @@ class CategoryAdmin(admin.ModelAdmin):
 
 
 # ==========================================
+# MEDICINE BATCH INLINE
+# ==========================================
+class MedicineBatchInline(admin.TabularInline):
+    model = MedicineBatch
+    extra = 1
+    fields = ('batch_number', 'quantity', 'expiry_date', 'manufacturing_date', 'supplier', 'expiry_status_display')
+    readonly_fields = ('expiry_status_display',)
+
+    @admin.display(description='Status')
+    def expiry_status_display(self, obj):
+        if not obj.pk:
+            return '—'
+        status = obj.expiry_status
+        if status == 'EXPIRED':
+            return '🔴 Expired'
+        elif status == 'EXPIRING_SOON':
+            return f'🟡 Expires in {obj.days_until_expiry} days'
+        return f'🟢 OK ({obj.days_until_expiry} days)'
+
+
+# ==========================================
 # MEDICINE
 # ==========================================
 @admin.register(Medicine)
 class MedicineAdmin(admin.ModelAdmin):
-    list_display = ('name', 'category', 'price', 'stock', 'requires_prescription')
+    list_display = ('name', 'category', 'price', 'stock', 'requires_prescription', 'expiry_alert')
     list_filter = ('category', 'requires_prescription')
     search_fields = ('name', 'brand')
     list_select_related = ['category']
+    inlines = [MedicineBatchInline]
+
+    @admin.display(description='Batch Alert')
+    def expiry_alert(self, obj):
+        soon = obj.batches.filter(
+            expiry_date__lte=timezone.now().date() + timezone.timedelta(days=30),
+            expiry_date__gte=timezone.now().date()
+        ).count()
+        expired = obj.batches.filter(expiry_date__lt=timezone.now().date()).count()
+        if expired:
+            return f'🔴 {expired} expired'
+        if soon:
+            return f'🟡 {soon} expiring soon'
+        return '🟢'
+
+
+# ==========================================
+# MEDICINE BATCH (standalone)
+# ==========================================
+@admin.register(MedicineBatch)
+class MedicineBatchAdmin(admin.ModelAdmin):
+    list_display = ('medicine', 'batch_number', 'quantity', 'expiry_date', 'expiry_status_display', 'supplier')
+    list_filter = ('expiry_date',)
+    search_fields = ('medicine__name', 'batch_number', 'supplier')
+    list_select_related = ['medicine']
+    date_hierarchy = 'expiry_date'
+
+    @admin.display(description='Status')
+    def expiry_status_display(self, obj):
+        status = obj.expiry_status
+        if status == 'EXPIRED':
+            return f'🔴 Expired {abs(obj.days_until_expiry)} days ago'
+        elif status == 'EXPIRING_SOON':
+            return f'🟡 Expires in {obj.days_until_expiry} days'
+        return f'🟢 OK'
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related('medicine')
 
 
 # ==========================================
@@ -94,7 +153,6 @@ class OrderAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at',)
     inlines = [OrderItemInline]
     list_select_related = True
-    # Lets you drill into orders by date from the admin list
     date_hierarchy = 'created_at'
 
 

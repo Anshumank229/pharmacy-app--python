@@ -2,6 +2,7 @@
 from django.db import models
 from django.contrib.auth.models import User
 from django.core.validators import MinValueValidator, MaxValueValidator
+from django.utils import timezone
 
 
 class Category(models.Model):
@@ -31,6 +32,43 @@ class Medicine(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class MedicineBatch(models.Model):
+    """Tracks stock batches per medicine with expiry dates."""
+    medicine = models.ForeignKey(Medicine, on_delete=models.CASCADE, related_name='batches')
+    batch_number = models.CharField(max_length=50)
+    quantity = models.PositiveIntegerField(default=0)
+    expiry_date = models.DateField()
+    manufacturing_date = models.DateField(blank=True, null=True)
+    supplier = models.CharField(max_length=100, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['expiry_date']
+        verbose_name = "Medicine Batch"
+        verbose_name_plural = "Medicine Batches"
+
+    def __str__(self):
+        return f"{self.medicine.name} — Batch {self.batch_number} (exp: {self.expiry_date})"
+
+    @property
+    def is_expired(self):
+        return self.expiry_date < timezone.now().date()
+
+    @property
+    def days_until_expiry(self):
+        delta = self.expiry_date - timezone.now().date()
+        return delta.days
+
+    @property
+    def expiry_status(self):
+        days = self.days_until_expiry
+        if days < 0:
+            return "EXPIRED"
+        elif days <= 30:
+            return "EXPIRING_SOON"
+        return "OK"
 
 
 class ServiceArea(models.Model):
@@ -92,7 +130,6 @@ class Order(models.Model):
     total_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     coupon_code = models.CharField(max_length=20, blank=True, null=True)
     discount_applied = models.PositiveIntegerField(default=0)
-    # CharField keeps manual shutil upload in sync — ImageField would conflict
     prescription_image = models.CharField(max_length=255, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
