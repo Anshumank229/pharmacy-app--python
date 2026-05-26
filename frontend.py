@@ -8,11 +8,10 @@ from datetime import datetime, timedelta
 import streamlit as st
 import requests
 
-API_URL = "http://127.0.0.1:8000/api"
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me-in-production")
+API_URL       = os.getenv('API_URL', 'http://127.0.0.1:8000/api')
+ADMIN_API_KEY = os.getenv('ADMIN_API_KEY', 'change-me-in-production')
 ADMIN_HEADERS = {"x-admin-key": ADMIN_API_KEY}
-ADMIN_EMAIL = "kumaranshuman500@gmail.com"
-WHATSAPP_NUMBER = "91XXXXXXXXXX"  # Replace with your actual number
+WHATSAPP_NUMBER = os.getenv('WHATSAPP_NUMBER', '91XXXXXXXXXX')
 
 st.set_page_config(page_title="Medicine Delivery", page_icon="💊", layout="wide")
 
@@ -31,15 +30,15 @@ st.markdown("""
 # 1. SESSION STATE
 # ==========================================
 defaults = {
-    'show_profile': False,
-    'show_admin': False,
-    'show_analytics': False,
-    'show_medicine_detail': False,
-    'selected_medicine_id': None,
-    'cart': [],
-    'user': None,
-    'last_area_name': '',
-    'last_pending_count': 0,
+    'show_profile':          False,
+    'show_admin':            False,
+    'show_analytics':        False,
+    'show_medicine_detail':  False,
+    'selected_medicine_id':  None,
+    'cart':                  [],
+    'user':                  None,
+    'last_area_name':        '',
+    'last_pending_count':    0,
 }
 for key, val in defaults.items():
     if key not in st.session_state:
@@ -47,22 +46,32 @@ for key, val in defaults.items():
 
 
 # ==========================================
-# 2. GOOGLE LOGIN URL CATCHER
+# 2. GOOGLE LOGIN — resolve signed token
+# FIX: we no longer put name+email in the URL directly.
+#      Django signs a short-lived token; we exchange it here for the real values.
 # ==========================================
 query_params = st.query_params
-if "email" in query_params and "name" in query_params:
-    email_from_google = query_params["email"]
-    name_from_google = query_params["name"]
+if "token" in query_params and not st.session_state.user:
+    token = query_params["token"]
     try:
-        role_resp = requests.get(f"{API_URL}/me", params={"email": email_from_google}, timeout=5)
-        is_admin = role_resp.json().get("is_admin", False) if role_resp.ok else False
+        resp = requests.get(f"{API_URL}/resolve-token", params={"token": token}, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            try:
+                role_resp = requests.get(f"{API_URL}/me", params={"email": data["email"]}, timeout=5)
+                is_admin = role_resp.json().get("is_admin", False) if role_resp.ok else False
+            except requests.exceptions.RequestException:
+                is_admin = False
+            st.session_state.user = {
+                "name":     data["name"],
+                "email":    data["email"],
+                "is_admin": is_admin,
+            }
+        else:
+            st.warning("Your login link has expired. Please log in again.")
     except requests.exceptions.RequestException:
-        is_admin = False
-    st.session_state.user = {
-        "name": name_from_google,
-        "email": email_from_google,
-        "is_admin": is_admin,
-    }
+        st.warning("Could not verify login. Please try again.")
+    # Always clear the token from the URL regardless of outcome
     st.query_params.clear()
 
 
@@ -104,6 +113,72 @@ def delivery_estimate(created_at_str: str) -> str:
 
 
 # ==========================================
+# HELPER — reorder
+# ==========================================
+def reorder(order: dict):
+    """
+    Adds all items from a past order into the cart.
+    Checks current stock via the medicine API before adding.
+    Skips out-of-stock items and warns the user.
+    """
+    added   = []
+    skipped = []
+
+    for item in order.get('items', []):
+        med_name = item['medicine']['name']
+        qty      = item['quantity']
+
+        try:
+            search_resp = requests.get(
+                f"{API_URL}/medicines",
+                params={"search": med_name},
+                timeout=5,
+            )
+            if search_resp.status_code != 200:
+                skipped.append(f"{med_name} (could not load)")
+                continue
+
+            results = search_resp.json()
+            med = next((m for m in results if m['name'] == med_name), None)
+            if not med:
+                skipped.append(f"{med_name} (not found)")
+                continue
+
+            stock = med.get('stock', 0)
+            if stock == 0:
+                skipped.append(f"{med_name} (out of stock)")
+                continue
+
+            qty_to_add = min(qty, stock)
+            item_found = False
+            for cart_item in st.session_state.cart:
+                if cart_item["medicine_id"] == med['id']:
+                    new_qty = cart_item["quantity"] + qty_to_add
+                    cart_item["quantity"] = min(new_qty, stock)
+                    item_found = True
+                    break
+
+            if not item_found:
+                st.session_state.cart.append({
+                    "medicine_id": med['id'],
+                    "name":        med['name'],
+                    "quantity":    qty_to_add,
+                    "price":       float(med['price']),
+                    "requires_rx": med.get('requires_prescription', False),
+                })
+
+            if qty_to_add < qty:
+                added.append(f"{med_name} ×{qty_to_add} (only {stock} in stock)")
+            else:
+                added.append(f"{med_name} ×{qty_to_add}")
+
+        except requests.exceptions.RequestException:
+            skipped.append(f"{med_name} (connection error)")
+
+    return added, skipped
+
+
+# ==========================================
 # 4. MEDICINE DETAIL PAGE
 # ==========================================
 if st.session_state.show_medicine_detail and st.session_state.selected_medicine_id:
@@ -125,7 +200,7 @@ if st.session_state.show_medicine_detail and st.session_state.selected_medicine_
             col1, col2 = st.columns([1, 2])
             with col1:
                 if med.get('image'):
-                    st.image(f"http://127.0.0.1:8000/media/{med['image']}", use_container_width=True)
+                    st.image(f"{API_URL.replace('/api','')}/media/{med['image']}", use_container_width=True)
                 else:
                     st.info("No image available")
 
@@ -144,12 +219,9 @@ if st.session_state.show_medicine_detail and st.session_state.selected_medicine_
                     st.success(f"In stock ({stock} available)")
 
                 details = []
-                if med.get('dosage_form'):
-                    details.append(f"**Form:** {med['dosage_form']}")
-                if med.get('strength'):
-                    details.append(f"**Strength:** {med['strength']}")
-                if med.get('category'):
-                    details.append(f"**Category:** {med['category']['name']}")
+                if med.get('dosage_form'): details.append(f"**Form:** {med['dosage_form']}")
+                if med.get('strength'):    details.append(f"**Strength:** {med['strength']}")
+                if med.get('category'):    details.append(f"**Category:** {med['category']['name']}")
                 for d in details:
                     st.markdown(d)
 
@@ -205,14 +277,14 @@ if st.session_state.show_medicine_detail and st.session_state.selected_medicine_
                 st.subheader("Leave a review")
                 with st.form(key=f"detail_review_{med_id}"):
                     rating  = st.slider("Rating", 1, 5, 5)
-                    comment = st.text_area("Your experience (optional)")
+                    comment = st.text_area("Your experience (optional)", max_chars=2000)
                     if st.form_submit_button("Submit review"):
                         try:
                             requests.post(
                                 f"{API_URL}/medicines/{med_id}/reviews",
                                 json={
                                     "customer_name": st.session_state.user.get('name', 'User'),
-                                    "rating": rating,
+                                    "rating":  rating,
                                     "comment": comment,
                                 },
                                 timeout=10,
@@ -298,7 +370,7 @@ if st.session_state.show_profile and st.session_state.user:
                             st.write(f"📮 **Pincode:** {order.get('pincode', '—')}")
                         with col2:
                             st.write(f"📞 **Phone:** {order.get('customer_phone', '—')}")
-                            total = order.get('total_price', 0)
+                            total    = order.get('total_price', 0)
                             discount = order.get('discount_applied', 0)
                             if discount:
                                 st.write(f"💰 **Total:** ₹{total:.2f} *(saved {discount}%)*")
@@ -309,7 +381,7 @@ if st.session_state.show_profile and st.session_state.user:
                             st.info(f"🚚 {delivery_estimate(order['created_at'])}")
 
                         if order.get('prescription_image'):
-                            st.info("📄 Prescription attached.")
+                            st.info("📄 Prescription attached to this order.")
 
                         st.write("**Items ordered:**")
                         for item in order['items']:
@@ -318,25 +390,49 @@ if st.session_state.show_profile and st.session_state.user:
                                 f"(₹{item['price_at_time_of_purchase']} each)"
                             )
 
-                        # PDF Invoice download
-                        invoice_url = f"{API_URL}/orders/{order['id']}/invoice?email={u['email']}"
-                        st.markdown(f"[📄 Download Invoice PDF]({invoice_url})")
+                        action_cols = st.columns(3)
 
-                        if status == 'PENDING':
-                            if st.button("Cancel order", key=f"cancel_{order['id']}"):
-                                try:
-                                    r = requests.put(
-                                        f"{API_URL}/orders/{order['id']}/cancel",
-                                        params={"email": u['email']},
-                                        timeout=10,
-                                    )
-                                    if r.status_code == 200:
-                                        st.success("Order cancelled.")
-                                        st.rerun()
-                                    else:
-                                        st.error(r.json().get('detail', 'Could not cancel.'))
-                                except requests.exceptions.RequestException as e:
-                                    st.error(f"Error: {e}")
+                        with action_cols[0]:
+                            invoice_url = f"{API_URL}/orders/{order['id']}/invoice?email={u['email']}"
+                            st.markdown(f"[📄 Invoice PDF]({invoice_url})")
+
+                        with action_cols[1]:
+                            if st.button(
+                                "🔄 Reorder",
+                                key=f"reorder_{order['id']}",
+                                use_container_width=True,
+                                help="Add all items from this order to your cart"
+                            ):
+                                with st.spinner("Checking stock and adding to cart…"):
+                                    added, skipped = reorder(order)
+                                if added:
+                                    st.success(f"Added to cart: {', '.join(added)}")
+                                if skipped:
+                                    st.warning(f"Skipped (unavailable): {', '.join(skipped)}")
+                                if added:
+                                    st.info("👈 Review your cart in the sidebar and checkout when ready.")
+
+                        with action_cols[2]:
+                            if status == 'PENDING':
+                                if st.button(
+                                    "❌ Cancel",
+                                    key=f"cancel_{order['id']}",
+                                    use_container_width=True,
+                                ):
+                                    try:
+                                        r = requests.put(
+                                            f"{API_URL}/orders/{order['id']}/cancel",
+                                            params={"email": u['email']},
+                                            timeout=10,
+                                        )
+                                        if r.status_code == 200:
+                                            st.success("Order cancelled.")
+                                            st.rerun()
+                                        else:
+                                            st.error(r.json().get('detail', 'Could not cancel.'))
+                                    except requests.exceptions.RequestException as e:
+                                        st.error(f"Error: {e}")
+
     except requests.exceptions.RequestException as e:
         st.error(f"Could not load orders: {e}")
 
@@ -356,20 +452,18 @@ if st.session_state.get('show_analytics'):
     try:
         resp = requests.get(f"{API_URL}/admin/analytics", headers=ADMIN_HEADERS, timeout=15)
         if resp.status_code == 200:
-            data = resp.json()
+            data    = resp.json()
             summary = data['summary']
 
-            # Summary metrics
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Total Revenue", f"₹{summary['total_revenue']:.0f}")
-            c2.metric("Total Orders", summary['total_orders'])
-            c3.metric("Delivered", summary['delivered'])
-            c4.metric("Cancelled", summary['cancelled'])
-            c5.metric("Delivery Rate", f"{summary['delivery_rate']}%")
+            c1.metric("Total Revenue",  f"₹{summary['total_revenue']:.0f}")
+            c2.metric("Total Orders",   summary['total_orders'])
+            c3.metric("Delivered",      summary['delivered'])
+            c4.metric("Cancelled",      summary['cancelled'])
+            c5.metric("Delivery Rate",  f"{summary['delivery_rate']}%")
 
             st.divider()
 
-            # Revenue chart
             if data['daily_revenue']:
                 st.subheader("Revenue — last 30 days")
                 import pandas as pd
@@ -386,7 +480,6 @@ if st.session_state.get('show_analytics'):
             st.divider()
 
             col1, col2 = st.columns(2)
-
             with col1:
                 st.subheader("Top medicines sold")
                 if data['top_medicines']:
@@ -417,16 +510,21 @@ if st.session_state.get('show_analytics'):
                     columns=['Status', 'Count']
                 )
                 st.bar_chart(df_status.set_index('Status'))
-
         else:
             st.error("Unauthorized.")
     except requests.exceptions.RequestException as e:
         st.error(f"Could not load analytics: {e}")
 
-    if st.button("Back to admin"):
-        st.session_state.show_analytics = False
-        st.session_state.show_admin = True
-        st.rerun()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("← Back to admin panel", use_container_width=True):
+            st.session_state.show_analytics = False
+            st.session_state.show_admin     = True
+            st.rerun()
+    with col2:
+        if st.button("← Back to store", use_container_width=True):
+            st.session_state.show_analytics = False
+            st.rerun()
     st.stop()
 
 
@@ -434,22 +532,25 @@ if st.session_state.get('show_analytics'):
 # 7. ADMIN DASHBOARD
 # ==========================================
 if st.session_state.get('show_admin'):
+    # FIX: guard — only staff users can reach this page
+    if not st.session_state.user or not st.session_state.user.get('is_admin'):
+        st.error("Unauthorized.")
+        st.stop()
+
     st.title("Admin control panel")
 
-    # Analytics and batch alert buttons
     btn_cols = st.columns(3)
     with btn_cols[0]:
         if st.button("📊 View analytics", use_container_width=True):
-            st.session_state.show_admin = False
+            st.session_state.show_admin     = False
             st.session_state.show_analytics = True
             st.rerun()
 
-    # Batch expiry alerts
     try:
         batch_resp = requests.get(f"{API_URL}/admin/batches/alerts", headers=ADMIN_HEADERS, timeout=10)
         if batch_resp.status_code == 200:
-            alerts = batch_resp.json()
-            expired = alerts.get('expired', [])
+            alerts   = batch_resp.json()
+            expired  = alerts.get('expired', [])
             expiring = alerts.get('expiring_soon', [])
             if expired:
                 st.error(f"🔴 {len(expired)} expired batch(es) — remove from stock immediately!")
@@ -463,9 +564,7 @@ if st.session_state.get('show_admin'):
         pass
 
     try:
-        orders_resp = requests.get(
-            f"{API_URL}/admin/orders", headers=ADMIN_HEADERS, timeout=10
-        )
+        orders_resp = requests.get(f"{API_URL}/admin/orders", headers=ADMIN_HEADERS, timeout=10)
         if orders_resp.status_code == 200:
             all_orders = orders_resp.json()
 
@@ -475,8 +574,8 @@ if st.session_state.get('show_admin'):
                 st.error(f"🔔 {new_count} new order(s) arrived!")
             st.session_state.last_pending_count = current_pending
 
-            today_str = datetime.now().date().isoformat()
-            todays = [o for o in all_orders if (o.get('created_at') or '').startswith(today_str)]
+            today_str       = datetime.now().date().isoformat()
+            todays          = [o for o in all_orders if (o.get('created_at') or '').startswith(today_str)]
             pending_today   = sum(1 for o in todays if o['status'] == 'PENDING')
             shipped_today   = sum(1 for o in todays if o['status'] == 'SHIPPED')
             delivered_today = sum(1 for o in todays if o['status'] == 'DELIVERED')
@@ -487,7 +586,6 @@ if st.session_state.get('show_admin'):
             cols[2].metric("Delivered today", delivered_today)
             cols[3].metric("Total orders",    len(all_orders))
 
-            # Low stock alert
             try:
                 from inventory.models import Medicine as Med
                 low = Med.objects.filter(stock__lte=5).values('name', 'stock')
@@ -514,10 +612,10 @@ if st.session_state.get('show_admin'):
                             st.caption(f"Coupon: {order.get('coupon_code')} — {order['discount_applied']}% off")
                         st.write(f"📍 {order.get('delivery_address', '—')}")
                         if order.get('prescription_image'):
+                            base_url = API_URL.replace('/api', '')
                             st.markdown(
-                                f"[📄 View prescription](http://127.0.0.1:8000/api/prescriptions/{order['prescription_image']})",
+                                f"[📄 View prescription]({base_url}/api/prescriptions/{order['prescription_image']})"
                             )
-                        # Admin invoice download
                         st.markdown(f"[🧾 Download invoice]({API_URL}/orders/{order['id']}/invoice?email={order['customer_email']})")
                     with c2:
                         st.write(f"Status: **{order['status']}**")
@@ -572,8 +670,9 @@ st.divider()
 st.sidebar.header("Your account")
 
 if not st.session_state.user:
-    st.sidebar.markdown("""
-        <a href="http://127.0.0.1:8000/login/google-oauth2/" target="_blank">
+    backend_base = API_URL.replace('/api', '')
+    st.sidebar.markdown(f"""
+        <a href="{backend_base}/login/google-oauth2/" target="_self">
             <button style="width:100%;padding:8px;cursor:pointer;border-radius:8px;border:1px solid #ccc;">
                 Continue with Google
             </button>
@@ -585,28 +684,44 @@ if not st.session_state.user:
     email    = st.sidebar.text_input("Email")
     password = st.sidebar.text_input("Password", type="password")
 
-    if st.sidebar.button("Continue", use_container_width=True):
-        if not email or not password:
-            st.sidebar.warning("Please enter both email and password.")
-        else:
-            try:
-                login_resp = requests.post(
-                    f"{API_URL}/login",
-                    json={"email": email, "password": password},
-                    timeout=10,
-                )
-                if login_resp.status_code == 200:
-                    data = login_resp.json()
-                    st.session_state.user = {
-                        "name": data.get("name", ""),
-                        "email": data.get("email", ""),
-                        "is_admin": data.get("is_admin", False),
-                    }
-                    st.rerun()
-                elif login_resp.status_code == 429:
-                    st.sidebar.error("Too many login attempts. Please wait a minute.")
-                else:
-                    default_name = email.split('@')[0].capitalize()
+    tab_login, tab_register = st.sidebar.tabs(["Log in", "Create account"])
+
+    # FIX: separate login and register flows — no more silent registration on wrong password
+    with tab_login:
+        if st.button("Log in", use_container_width=True, key="btn_login"):
+            if not email or not password:
+                st.sidebar.warning("Please enter both email and password.")
+            else:
+                try:
+                    login_resp = requests.post(
+                        f"{API_URL}/login",
+                        json={"email": email, "password": password},
+                        timeout=10,
+                    )
+                    if login_resp.status_code == 200:
+                        data = login_resp.json()
+                        st.session_state.user = {
+                            "name":     data.get("name", ""),
+                            "email":    data.get("email", ""),
+                            "is_admin": data.get("is_admin", False),
+                        }
+                        st.rerun()
+                    elif login_resp.status_code == 429:
+                        st.sidebar.error("Too many login attempts. Please wait a minute.")
+                    else:
+                        st.sidebar.error("Incorrect email or password. Please try again.")
+                except requests.exceptions.RequestException as e:
+                    st.sidebar.error(f"Connection error: {e}")
+
+    with tab_register:
+        if st.button("Create account", use_container_width=True, key="btn_register"):
+            if not email or not password:
+                st.sidebar.warning("Please enter both email and password.")
+            elif len(password) < 8:
+                st.sidebar.warning("Password must be at least 8 characters.")
+            else:
+                default_name = email.split('@')[0].capitalize()
+                try:
                     reg_resp = requests.post(
                         f"{API_URL}/register",
                         json={"name": default_name, "email": email, "password": password},
@@ -614,22 +729,25 @@ if not st.session_state.user:
                     )
                     if reg_resp.status_code in [200, 201]:
                         st.session_state.user = {
-                            "name": default_name,
-                            "email": email,
+                            "name":     default_name,
+                            "email":    email,
                             "is_admin": False,
                         }
                         st.sidebar.success("Welcome! Your account has been created.")
                         st.rerun()
+                    elif reg_resp.status_code == 400:
+                        st.sidebar.error("An account with this email already exists. Please log in.")
                     else:
-                        st.sidebar.error("Incorrect password. Please try again.")
-            except requests.exceptions.RequestException as e:
-                st.sidebar.error(f"Connection error: {e}")
+                        st.sidebar.error("Registration failed. Please try again.")
+                except requests.exceptions.RequestException as e:
+                    st.sidebar.error(f"Connection error: {e}")
 else:
     st.sidebar.write(f"Logged in as: **{st.session_state.user.get('name', 'User')}**")
     if st.sidebar.button("My profile & orders", use_container_width=True):
         st.session_state.show_profile = True
         st.rerun()
-    if st.session_state.user.get('email') == ADMIN_EMAIL and st.session_state.user.get('is_admin'):
+    # FIX: show admin button for ANY staff user, not just one hardcoded email
+    if st.session_state.user.get('is_admin'):
         if st.sidebar.button("Admin dashboard", use_container_width=True):
             st.session_state.show_admin = True
             st.rerun()
@@ -692,7 +810,7 @@ else:
         else:
             st.sidebar.warning("Enter a valid 6-digit pincode.")
 
-    coupon_code = st.sidebar.text_input("Coupon code (optional)")
+    coupon_code      = st.sidebar.text_input("Coupon code (optional)", max_chars=20)
     discount_percent = 0
     if coupon_code:
         try:
@@ -720,7 +838,11 @@ else:
         st.sidebar.caption("Enter a serviceable pincode to enable checkout.")
 
     if st.sidebar.button("Confirm order", type="primary", disabled=not pincode_ok, use_container_width=True):
-        if not customer_phone:
+        if not customer_name:
+            st.sidebar.error("Full name is required.")
+        elif not customer_email:
+            st.sidebar.error("Email is required.")
+        elif not customer_phone:
             st.sidebar.error("Phone number is required.")
         elif not customer_address:
             st.sidebar.error("Delivery address is required.")
@@ -739,13 +861,13 @@ else:
                         st.stop()
 
                 payload = {
-                    "customer_name":    customer_name,
-                    "customer_email":   customer_email,
-                    "customer_phone":   customer_phone,
-                    "delivery_address": customer_address,
-                    "pincode":          pincode,
+                    "customer_name":      customer_name,
+                    "customer_email":     customer_email,
+                    "customer_phone":     customer_phone,
+                    "delivery_address":   customer_address,
+                    "pincode":            pincode,
                     "prescription_image": rx_filename,
-                    "coupon_code":      coupon_code if coupon_code else None,
+                    "coupon_code":        coupon_code if coupon_code else None,
                     "items": [
                         {"medicine_id": i["medicine_id"], "quantity": i["quantity"]}
                         for i in st.session_state.cart
@@ -755,7 +877,7 @@ else:
                 resp = requests.post(f"{API_URL}/orders", json=payload, timeout=10)
                 if resp.status_code == 200:
                     order = resp.json()
-                    msg = f"✅ Order #{order['id']} placed! Total: ₹{order['total_price']:.2f}"
+                    msg  = f"✅ Order #{order['id']} placed! Total: ₹{order['total_price']:.2f}"
                     if order.get('discount_applied'):
                         msg += f" ({order['discount_applied']}% coupon applied)"
                     msg += f". Expected within 24 hours. We'll call {customer_phone} before arrival."
@@ -786,6 +908,8 @@ else:
 
                     st.session_state.cart = []
                     st.rerun()
+                elif resp.status_code == 429:
+                    st.sidebar.error("Too many orders placed. Please wait a moment and try again.")
                 else:
                     st.sidebar.error(resp.json().get('detail', 'Order failed. Please try again.'))
             except requests.exceptions.RequestException as e:
@@ -799,7 +923,7 @@ st.subheader("Available medicines")
 ctrl_cols = st.columns([2, 1, 1, 1])
 
 with ctrl_cols[0]:
-    search_query = st.text_input("Search by name or brand…", "")
+    search_query = st.text_input("Search by name or brand…", "", max_chars=100)
 
 category_id = None
 try:
@@ -840,12 +964,13 @@ try:
             st.info("No medicines found.")
         else:
             num_cols = 2 if col_count == "2 columns" else 3
-            cols = st.columns(num_cols)
+            cols     = st.columns(num_cols)
+            base_url = API_URL.replace('/api', '')
             for index, med in enumerate(medicines):
                 with cols[index % num_cols]:
                     if med.get('image'):
                         st.image(
-                            f"http://127.0.0.1:8000/media/{med['image']}",
+                            f"{base_url}/media/{med['image']}",
                             use_container_width=True,
                         )
                     else:
@@ -916,7 +1041,7 @@ try:
                         if st.session_state.user:
                             with st.form(key=f"review_form_{med['id']}"):
                                 rating  = st.slider("Rating", 1, 5, 5)
-                                comment = st.text_area("Your experience (optional)")
+                                comment = st.text_area("Your experience (optional)", max_chars=2000)
                                 if st.form_submit_button("Submit review"):
                                     try:
                                         requests.post(
