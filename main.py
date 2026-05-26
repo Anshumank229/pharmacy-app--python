@@ -12,6 +12,9 @@ django.setup()
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
 from django.core.wsgi import get_wsgi_application
+from django.core.mail import send_mail
+from django.core import signing
+from django.conf import settings as django_settings
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Depends, Header
 from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,12 +22,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, field_validator, Field
 from typing import List, Optional, Literal
 from django.db import transaction
-from django.db.models import Sum, Count
+from django.db.models import Sum, Count, F
 from django.utils import timezone
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import io
+import threading
 
 django_app = get_wsgi_application()
 
@@ -36,9 +40,11 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+STREAMLIT_URL = os.getenv('STREAMLIT_URL', 'http://localhost:8501')
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
+    allow_origins=[STREAMLIT_URL, 'http://127.0.0.1:8501'],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,7 +54,179 @@ os.makedirs("media/prescriptions", exist_ok=True)
 os.makedirs("media/medicines", exist_ok=True)
 os.makedirs("media/invoices", exist_ok=True)
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "change-me-in-production")
+# FIX: read from Django settings so there's one source of truth
+ADMIN_API_KEY = getattr(django_settings, 'ADMIN_API_KEY', 'change-me-in-production')
+
+# Allowed prescription file extensions
+ALLOWED_RX_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.pdf'}
+
+
+# ==========================================
+# EMAIL HELPERS
+# All emails are sent in background threads so they never
+# slow down the API response — fire and forget.
+# ==========================================
+
+def _send_email_bg(subject: str, message: str, recipient: str):
+    """Internal: send email in a background thread."""
+    def _send():
+        try:
+            send_mail(
+                subject=subject,
+                message=message,
+                from_email=django_settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[recipient],
+                fail_silently=True,
+            )
+        except Exception:
+            pass  # Never crash the API over email failure
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def send_welcome_email(name: str, email: str):
+    subject = "Welcome to Your Local Pharmacy! 💊"
+    message = f"""Hi {name},
+
+Welcome to Your Local Pharmacy! We're glad to have you.
+
+You can now order medicines online and get them delivered to your door within 24 hours. We accept cash on delivery — no advance payment needed.
+
+Here's what you can do:
+  • Browse and search medicines by name or category
+  • Add medicines to your cart and checkout in minutes
+  • Track your order status in "My Profile & Orders"
+  • Download invoices for every order
+
+If you ever need help, reach us on WhatsApp — the link is on our storefront.
+
+Thanks for joining us!
+
+— Your Local Pharmacy Team
+"""
+    _send_email_bg(subject, message, email)
+
+
+def send_order_confirmation_email(order: Order):
+    items_text = "\n".join(
+        f"  • {item.medicine.name} × {item.quantity} — ₹{float(item.price_at_time_of_purchase) * item.quantity:.2f}"
+        for item in order.items.all()
+    )
+    discount_text = f"\n  Discount applied: {order.discount_applied}%" if order.discount_applied else ""
+
+    subject = f"Order #{order.id} Confirmed — Your Local Pharmacy 💊"
+    message = f"""Hi {order.customer_name},
+
+Your order has been placed successfully! Here are the details:
+
+ORDER #{order.id}
+─────────────────────────────────
+{items_text}{discount_text}
+
+  TOTAL: ₹{float(order.total_price):.2f}
+─────────────────────────────────
+
+Delivery address: {order.delivery_address}, {order.pincode}
+Contact number:   {order.customer_phone}
+
+Expected delivery: within 24 hours
+Payment: Cash on delivery — pay when your order arrives.
+
+We'll call you on {order.customer_phone} before arrival.
+
+You can track your order status anytime by visiting our store and going to "My Profile & Orders".
+
+Thank you for ordering from us!
+
+— Your Local Pharmacy Team
+"""
+    _send_email_bg(subject, message, order.customer_email)
+
+
+def send_shipped_email(order: Order):
+    subject = f"Order #{order.id} is On Its Way! 🚚"
+    message = f"""Hi {order.customer_name},
+
+Great news — your order #{order.id} has been dispatched and is on its way to you!
+
+Delivery address: {order.delivery_address}, {order.pincode}
+Our delivery person will call you on {order.customer_phone} before arriving.
+
+Expected delivery: within the next few hours.
+Payment: Please keep ₹{float(order.total_price):.2f} ready (cash on delivery).
+
+If you have any questions, reach us on WhatsApp from our storefront.
+
+— Your Local Pharmacy Team
+"""
+    _send_email_bg(subject, message, order.customer_email)
+
+
+def send_delivered_email(order: Order):
+    subject = f"Order #{order.id} Delivered — Thank You! ✅"
+    message = f"""Hi {order.customer_name},
+
+Your order #{order.id} has been delivered successfully. We hope everything was as expected!
+
+ORDER SUMMARY
+─────────────────────────────────
+""" + "\n".join(
+        f"  • {item.medicine.name} × {item.quantity}"
+        for item in order.items.all()
+    ) + f"""
+─────────────────────────────────
+Total paid: ₹{float(order.total_price):.2f} (cash on delivery)
+
+You can download your invoice anytime from "My Profile & Orders" in our store.
+
+We'd love to hear your feedback — you can leave a review for each medicine on our storefront. It helps other customers and helps us improve!
+
+Need to reorder? Just visit our store and click "🔄 Reorder" on this order.
+
+Thank you for choosing Your Local Pharmacy!
+
+— Your Local Pharmacy Team
+"""
+    _send_email_bg(subject, message, order.customer_email)
+
+
+def send_cancelled_email(order: Order):
+    subject = f"Order #{order.id} Cancelled"
+    message = f"""Hi {order.customer_name},
+
+Your order #{order.id} has been cancelled and your stock has been restored.
+
+If you cancelled by mistake, you can place a new order anytime from our store.
+If we cancelled your order, please contact us on WhatsApp and we'll sort it out right away.
+
+— Your Local Pharmacy Team
+"""
+    _send_email_bg(subject, message, order.customer_email)
+
+
+def send_new_order_admin_email(order: Order):
+    """FIX: Notify admin by email whenever a new order arrives."""
+    admin_email = os.getenv('EMAIL_HOST_USER', '')
+    if not admin_email:
+        return
+    items_text = "\n".join(
+        f"  • {item.medicine.name} × {item.quantity}"
+        for item in order.items.all()
+    )
+    subject = f"🔔 New Order #{order.id} — ₹{float(order.total_price):.2f}"
+    message = f"""New order received!
+
+Order #{order.id}
+Customer: {order.customer_name}
+Phone:    {order.customer_phone}
+Address:  {order.delivery_address}, {order.pincode}
+Total:    ₹{float(order.total_price):.2f}
+
+Items:
+{items_text}
+
+Log in to the admin dashboard to process this order.
+"""
+    _send_email_bg(subject, message, admin_email)
 
 
 # ==========================================
@@ -62,6 +240,8 @@ def verify_admin(x_admin_key: str = Header(...)):
 
 # ==========================================
 # SCHEMAS
+# FIX: added Field(max_length=...) to all user-supplied string fields
+#      to prevent absurdly large inputs
 # ==========================================
 class CategorySchema(BaseModel):
     name: str
@@ -116,18 +296,19 @@ class MedicineDetailSchema(BaseModel):
 
 class OrderItemCreateSchema(BaseModel):
     medicine_id: int
-    quantity: int
+    quantity: int = Field(..., ge=1, le=100)  # FIX: cap quantity per item
 
 
 class OrderCreateSchema(BaseModel):
-    customer_name: str
-    customer_email: str
-    customer_phone: str
-    delivery_address: str
-    pincode: str
-    prescription_image: Optional[str] = None
-    coupon_code: Optional[str] = None
-    items: List[OrderItemCreateSchema]
+    # FIX: max_length on every user-supplied field
+    customer_name: str    = Field(..., min_length=1, max_length=255)
+    customer_email: str   = Field(..., max_length=254)
+    customer_phone: str   = Field(..., min_length=7, max_length=15)
+    delivery_address: str = Field(..., min_length=5, max_length=500)
+    pincode: str          = Field(..., min_length=6, max_length=10)
+    prescription_image: Optional[str] = Field(None, max_length=255)
+    coupon_code: Optional[str]        = Field(None, max_length=20)
+    items: List[OrderItemCreateSchema] = Field(..., min_length=1, max_length=50)
 
 
 class OrderResponseSchema(BaseModel):
@@ -169,23 +350,23 @@ class OrderDetailSchema(BaseModel):
 
 
 class UserRegisterSchema(BaseModel):
-    name: str
-    email: str
-    password: str
+    name: str  = Field(..., min_length=1, max_length=150)
+    email: str = Field(..., max_length=254)
+    password: str = Field(..., min_length=8, max_length=128)
 
 
 class UserLoginSchema(BaseModel):
-    email: str
-    password: str
+    email: str    = Field(..., max_length=254)
+    password: str = Field(..., max_length=128)
 
 
 class ProfileUpdateSchema(BaseModel):
-    email: str
-    name: str
-    phone: str
-    address: str
-    pincode: str
-    area_name: str = ""
+    email: str      = Field(..., max_length=254)
+    name: str       = Field(..., max_length=150)
+    phone: str      = Field(..., max_length=15)
+    address: str    = Field(..., max_length=500)
+    pincode: str    = Field(..., max_length=10)
+    area_name: str  = Field("", max_length=100)
 
 
 class ReviewSchema(BaseModel):
@@ -197,9 +378,28 @@ class ReviewSchema(BaseModel):
 
 
 class ReviewCreateSchema(BaseModel):
-    customer_name: str
-    rating: int = Field(..., ge=1, le=5)
-    comment: Optional[str] = None
+    customer_name: str    = Field(..., min_length=1, max_length=255)
+    rating: int           = Field(..., ge=1, le=5)
+    comment: Optional[str] = Field(None, max_length=2000)
+
+
+# ==========================================
+# HELPER — resolve signed login token
+# FIX: Streamlit exchanges the token here instead of reading raw email from URL
+# ==========================================
+@app.get("/api/resolve-token")
+def resolve_token(token: str):
+    """
+    Called by Streamlit after Google OAuth redirect.
+    Validates the signed token (max age 5 minutes) and returns name + email.
+    """
+    try:
+        payload = signing.loads(token, salt='streamlit-login', max_age=300)
+        return {"name": payload["name"], "email": payload["email"]}
+    except signing.SignatureExpired:
+        raise HTTPException(status_code=400, detail="Login link has expired. Please log in again.")
+    except signing.BadSignature:
+        raise HTTPException(status_code=400, detail="Invalid login token.")
 
 
 # ==========================================
@@ -242,15 +442,17 @@ def health():
 # ROUTES — AUTH
 # ==========================================
 @app.post("/api/register")
-def register_user(user_data: UserRegisterSchema):
+@limiter.limit("5/minute")  # FIX: rate-limit registration to slow enumeration
+def register_user(request: Request, user_data: UserRegisterSchema):
     if User.objects.filter(username=user_data.email).exists():
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=400, detail="Email already registered.")
     new_user = User.objects.create_user(
         username=user_data.email,
         email=user_data.email,
         password=user_data.password,
         first_name=user_data.name,
     )
+    send_welcome_email(name=user_data.name, email=user_data.email)
     return {"message": "Account created successfully", "user_id": new_user.id}
 
 
@@ -265,7 +467,7 @@ def login_user(request: Request, user_data: UserLoginSchema):
             "email": auth_user.email,
             "is_admin": auth_user.is_staff or auth_user.is_superuser,
         }
-    raise HTTPException(status_code=401, detail="Invalid email or password")
+    raise HTTPException(status_code=401, detail="Invalid email or password.")
 
 
 @app.get("/api/me")
@@ -350,6 +552,8 @@ def get_medicines(category_id: Optional[int] = None, search: Optional[str] = Non
     if category_id is not None:
         medicines = medicines.filter(category_id=category_id)
     if search is not None:
+        # FIX: cap search length to avoid abuse
+        search = search[:100]
         medicines = medicines.filter(name__icontains=search) | medicines.filter(brand__icontains=search)
     return list(medicines)
 
@@ -409,12 +613,9 @@ def get_batch_alerts():
 @app.get("/api/admin/analytics", dependencies=[Depends(verify_admin)])
 def get_analytics():
     from django.db.models.functions import TruncDate
-    from django.db.models import FloatField
-    from django.db.models.functions import Cast
 
     orders = Order.objects.exclude(status='CANCELLED')
 
-    # Revenue by day (last 30 days)
     thirty_days_ago = timezone.now() - timezone.timedelta(days=30)
     daily = (
         orders.filter(created_at__gte=thirty_days_ago)
@@ -424,7 +625,6 @@ def get_analytics():
         .order_by('day')
     )
 
-    # Top medicines by quantity sold
     top_medicines = (
         OrderItem.objects
         .values('medicine__name')
@@ -432,24 +632,21 @@ def get_analytics():
         .order_by('-total_qty')[:10]
     )
 
-    # Orders by pincode
     by_pincode = (
         Order.objects.values('pincode')
         .annotate(count=Count('id'))
         .order_by('-count')
     )
 
-    # Status breakdown
     status_counts = (
         Order.objects.values('status')
         .annotate(count=Count('id'))
     )
 
-    # Total revenue
     total_revenue = orders.aggregate(total=Sum('total_price'))['total'] or 0
-    total_orders = Order.objects.count()
-    delivered = Order.objects.filter(status='DELIVERED').count()
-    cancelled = Order.objects.filter(status='CANCELLED').count()
+    total_orders  = Order.objects.count()
+    delivered     = Order.objects.filter(status='DELIVERED').count()
+    cancelled     = Order.objects.filter(status='CANCELLED').count()
 
     return {
         "summary": {
@@ -460,19 +657,11 @@ def get_analytics():
             "delivery_rate": round(delivered / total_orders * 100, 1) if total_orders else 0,
         },
         "daily_revenue": [
-            {
-                "date": str(d['day']),
-                "revenue": float(d['revenue'] or 0),
-                "orders": d['count'],
-            }
+            {"date": str(d['day']), "revenue": float(d['revenue'] or 0), "orders": d['count']}
             for d in daily
         ],
         "top_medicines": [
-            {
-                "name": m['medicine__name'],
-                "qty_sold": m['total_qty'],
-                "revenue": float(m['total_revenue'] or 0),
-            }
+            {"name": m['medicine__name'], "qty_sold": m['total_qty'], "revenue": float(m['total_revenue'] or 0)}
             for m in top_medicines
         ],
         "by_pincode": [{"pincode": p['pincode'], "orders": p['count']} for p in by_pincode],
@@ -484,9 +673,10 @@ def get_analytics():
 # ROUTES — PRESCRIPTIONS
 # ==========================================
 @app.post("/api/upload-prescription")
-def upload_prescription(file: UploadFile = File(...)):
+@limiter.limit("20/minute")
+def upload_prescription(request: Request, file: UploadFile = File(...)):
     ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in ['.jpg', '.jpeg', '.png', '.pdf']:
+    if ext not in ALLOWED_RX_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Only JPG, PNG, or PDF files are allowed.")
     safe_filename = f"{uuid.uuid4().hex}{ext}"
     file_location = f"media/prescriptions/{safe_filename}"
@@ -499,7 +689,11 @@ def upload_prescription(file: UploadFile = File(...)):
 def serve_prescription(filename: str, x_admin_key: str = Header(...)):
     if not secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
         raise HTTPException(status_code=403, detail="Unauthorized")
+    # FIX: basename + extension whitelist on read, not just on write
     safe_filename = os.path.basename(filename)
+    ext = os.path.splitext(safe_filename)[1].lower()
+    if ext not in ALLOWED_RX_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Invalid file type.")
     path = f"media/prescriptions/{safe_filename}"
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File not found")
@@ -511,14 +705,13 @@ def serve_prescription(filename: str, x_admin_key: str = Header(...)):
 # ==========================================
 @app.get("/api/orders/{order_id}/invoice")
 def download_invoice(order_id: int, email: str):
-    """Generate and stream a PDF invoice for an order."""
     try:
         order = Order.objects.prefetch_related('items__medicine').get(id=order_id)
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Only the customer or admin can download
-    if order.customer_email != email:
+    # FIX: ownership check — same as cancel
+    if order.customer_email.lower() != email.lower():
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     try:
@@ -536,21 +729,18 @@ def download_invoice(order_id: int, email: str):
     styles = getSampleStyleSheet()
     elements = []
 
-    # Header
     title_style = ParagraphStyle('title', parent=styles['Heading1'], fontSize=20, spaceAfter=4)
-    sub_style = ParagraphStyle('sub', parent=styles['Normal'], fontSize=10, textColor=colors.grey)
+    sub_style   = ParagraphStyle('sub',   parent=styles['Normal'],   fontSize=10, textColor=colors.grey)
     elements.append(Paragraph("Your Local Pharmacy", title_style))
     elements.append(Paragraph("Medicine delivery — Cash on delivery", sub_style))
     elements.append(Spacer(1, 8*mm))
 
-    # Invoice info
     info_style = ParagraphStyle('info', parent=styles['Normal'], fontSize=11, spaceAfter=3)
     elements.append(Paragraph(f"<b>Invoice #</b> {order.id}", info_style))
     elements.append(Paragraph(f"<b>Date:</b> {order.created_at.strftime('%d %b %Y, %I:%M %p')}", info_style))
     elements.append(Paragraph(f"<b>Status:</b> {order.status}", info_style))
     elements.append(Spacer(1, 4*mm))
 
-    # Customer info
     elements.append(Paragraph("<b>Delivery Details</b>", styles['Heading3']))
     elements.append(Paragraph(f"{order.customer_name}", info_style))
     elements.append(Paragraph(f"Phone: {order.customer_phone}", info_style))
@@ -558,7 +748,6 @@ def download_invoice(order_id: int, email: str):
     elements.append(Paragraph(f"Pincode: {order.pincode}", info_style))
     elements.append(Spacer(1, 6*mm))
 
-    # Items table
     elements.append(Paragraph("<b>Items Ordered</b>", styles['Heading3']))
     elements.append(Spacer(1, 2*mm))
 
@@ -574,7 +763,6 @@ def download_invoice(order_id: int, email: str):
             f"Rs. {line_total:.2f}",
         ])
 
-    # Discount row
     if order.discount_applied:
         discount_amt = subtotal * order.discount_applied / 100
         table_data.append(['', '', f'Discount ({order.discount_applied}%)', f'- Rs. {discount_amt:.2f}'])
@@ -583,22 +771,21 @@ def download_invoice(order_id: int, email: str):
 
     table = Table(table_data, colWidths=[90*mm, 20*mm, 40*mm, 35*mm])
     table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 11),
-        ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
-        ('ALIGN', (2, 0), (-1, -1), 'RIGHT'),
-        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-        ('LINEABOVE', (0, -1), (-1, -1), 1, colors.black),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#f5f5f5')]),
-        ('FONTSIZE', (0, 1), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cccccc')),
+        ('BACKGROUND',    (0, 0),  (-1, 0),  colors.HexColor('#1a1a2e')),
+        ('TEXTCOLOR',     (0, 0),  (-1, 0),  colors.white),
+        ('FONTNAME',      (0, 0),  (-1, 0),  'Helvetica-Bold'),
+        ('FONTSIZE',      (0, 0),  (-1, 0),  11),
+        ('ALIGN',         (1, 0),  (-1, -1), 'CENTER'),
+        ('ALIGN',         (2, 0),  (-1, -1), 'RIGHT'),
+        ('FONTNAME',      (0, -1), (-1, -1), 'Helvetica-Bold'),
+        ('LINEABOVE',     (0, -1), (-1, -1), 1, colors.black),
+        ('ROWBACKGROUNDS',(0, 1),  (-1, -2), [colors.white, colors.HexColor('#f5f5f5')]),
+        ('FONTSIZE',      (0, 1),  (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0),  (-1, -1), 6),
+        ('TOPPADDING',    (0, 0),  (-1, -1), 6),
+        ('GRID',          (0, 0),  (-1, -1), 0.5, colors.HexColor('#cccccc')),
     ]))
     elements.append(table)
-
     elements.append(Spacer(1, 8*mm))
     elements.append(Paragraph("Thank you for your order! Pay on delivery.", sub_style))
     elements.append(Paragraph("For support, contact us on WhatsApp.", sub_style))
@@ -617,25 +804,16 @@ def download_invoice(order_id: int, email: str):
 # ROUTES — ORDERS
 # ==========================================
 @app.post("/api/orders", response_model=OrderResponseSchema)
-def checkout(order_in: OrderCreateSchema):
+@limiter.limit("10/minute")  # FIX: rate-limit checkout to deter stock-flooding attacks
+def checkout(request: Request, order_in: OrderCreateSchema):
     area = ServiceArea.objects.filter(pincode=order_in.pincode.strip(), is_active=True).first()
     if not area:
         raise HTTPException(status_code=400, detail="We don't deliver to this pincode yet.")
 
-    item_ids = [i.medicine_id for i in order_in.items]
+    item_ids   = [i.medicine_id for i in order_in.items]
     rx_required = Medicine.objects.filter(id__in=item_ids, requires_prescription=True).exists()
     if rx_required and not order_in.prescription_image:
         raise HTTPException(status_code=400, detail="A prescription is required for one or more items.")
-
-    coupon = None
-    discount_percent = 0
-    if order_in.coupon_code:
-        coupon = Coupon.objects.filter(
-            code=order_in.coupon_code.upper().strip(), is_active=True
-        ).first()
-        if not coupon or coupon.times_used >= coupon.max_uses:
-            raise HTTPException(status_code=400, detail="Invalid or expired coupon code.")
-        discount_percent = coupon.discount_percent
 
     try:
         with transaction.atomic():
@@ -648,13 +826,13 @@ def checkout(order_in: OrderCreateSchema):
                 status='PENDING',
                 prescription_image=order_in.prescription_image,
                 coupon_code=order_in.coupon_code,
-                discount_applied=discount_percent,
+                discount_applied=0,  # set below after coupon atomically
             )
 
             total_order_price = 0
             for item in order_in.items:
                 try:
-                    medicine = Medicine.objects.get(id=item.medicine_id)
+                    medicine = Medicine.objects.select_for_update().get(id=item.medicine_id)
                 except Medicine.DoesNotExist:
                     raise HTTPException(status_code=404, detail=f"Medicine ID {item.medicine_id} not found.")
 
@@ -673,13 +851,30 @@ def checkout(order_in: OrderCreateSchema):
                 medicine.stock -= item.quantity
                 medicine.save()
 
-            if discount_percent:
-                total_order_price *= (1 - discount_percent / 100)
-                coupon.times_used += 1
-                coupon.save()
+            discount_percent = 0
+            if order_in.coupon_code:
+                # FIX: atomic coupon increment — prevents race condition where two
+                # simultaneous checkouts both pass the "times_used < max_uses" check
+                updated = Coupon.objects.filter(
+                    code=order_in.coupon_code.upper().strip(),
+                    is_active=True,
+                    times_used__lt=F('max_uses'),
+                ).update(times_used=F('times_used') + 1)
 
+                if not updated:
+                    raise HTTPException(status_code=400, detail="Invalid or expired coupon code.")
+
+                coupon = Coupon.objects.get(code=order_in.coupon_code.upper().strip())
+                discount_percent = coupon.discount_percent
+                total_order_price *= (1 - discount_percent / 100)
+
+            order.discount_applied = discount_percent
             order.total_price = round(total_order_price, 2)
             order.save()
+
+            order_with_items = Order.objects.prefetch_related('items__medicine').get(id=order.id)
+            send_order_confirmation_email(order_with_items)
+            send_new_order_admin_email(order_with_items)  # FIX: alert admin
 
             return {
                 "id": order.id,
@@ -695,10 +890,13 @@ def checkout(order_in: OrderCreateSchema):
         raise HTTPException(status_code=500, detail=f"Checkout failed: {str(e)}")
 
 
+# FIX: require email param so only the order's owner can fetch it
 @app.get("/api/orders/{order_id}", response_model=OrderDetailSchema)
-def get_order(order_id: int):
+def get_order(order_id: int, email: str):
     try:
-        order = Order.objects.prefetch_related('items__medicine').get(id=order_id)
+        order = Order.objects.prefetch_related('items__medicine').get(
+            id=order_id, customer_email=email
+        )
         return serialize_order(order)
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -729,6 +927,9 @@ def cancel_order(order_id: int, email: str):
         order.status = 'CANCELLED'
         order.save()
 
+    order_with_items = Order.objects.prefetch_related('items__medicine').get(id=order_id)
+    send_cancelled_email(order_with_items)
+
     return {"message": "Order cancelled and stock restored."}
 
 
@@ -747,11 +948,28 @@ def update_order_status(
     status: Literal['PENDING', 'SHIPPED', 'DELIVERED', 'CANCELLED']
 ):
     try:
-        order = Order.objects.get(id=order_id)
+        order = Order.objects.prefetch_related('items__medicine').get(id=order_id)
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found.")
+
+    old_status  = order.status
     order.status = status
     order.save()
+
+    if old_status != status:
+        if status == 'SHIPPED':
+            send_shipped_email(order)
+        elif status == 'DELIVERED':
+            send_delivered_email(order)
+        elif status == 'CANCELLED':
+            # FIX: restore stock when admin cancels an order
+            if old_status != 'DELIVERED':
+                with transaction.atomic():
+                    for item in order.items.all():
+                        item.medicine.stock += item.quantity
+                        item.medicine.save()
+            send_cancelled_email(order)
+
     return {"message": "Status updated"}
 
 
@@ -764,7 +982,8 @@ def get_reviews(medicine_id: int):
 
 
 @app.post("/api/medicines/{medicine_id}/reviews", response_model=ReviewSchema)
-def create_review(medicine_id: int, review_in: ReviewCreateSchema):
+@limiter.limit("10/minute")  # FIX: prevent review spam
+def create_review(request: Request, medicine_id: int, review_in: ReviewCreateSchema):
     try:
         medicine = Medicine.objects.get(id=medicine_id)
     except Medicine.DoesNotExist:

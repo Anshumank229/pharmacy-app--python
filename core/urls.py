@@ -1,36 +1,32 @@
-"""
-URL configuration for core project.
-
-The `urlpatterns` list routes URLs to views. For more information please see:
-    https://docs.djangoproject.com/en/6.0/topics/http/urls/
-Examples:
-Function views
-    1. Add an import:  from my_app import views
-    2. Add a URL to urlpatterns:  path('', views.home, name='home')
-Class-based views
-    1. Add an import:  from other_app.views import Home
-    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
-Including another URLconf
-    1. Import the include() function: from django.urls import include, path
-    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
-"""
 # core/urls.py
 from django.contrib import admin
 from django.urls import path, include
 from django.shortcuts import redirect
 from django.contrib.auth.decorators import login_required
+from django.core import signing
+from django.conf import settings
 
-# 1. Create the bridge function
+
+# ==========================================
+# FIX: Instead of putting name+email in the URL (visible in browser history,
+# server logs, etc.), we sign a short-lived token and pass only that.
+# Streamlit reads the token and exchanges it via /api/resolve-token.
+# Token expires in 5 minutes — enough for the redirect, too short to misuse.
+# ==========================================
 @login_required
 def redirect_to_streamlit(request):
-    name = request.user.first_name or request.user.username
-    email = request.user.email
-    # Send the user to Streamlit, and attach their name and email to the URL!
-    return redirect(f"http://localhost:8501/?name={name}&email={email}")
+    payload = {
+        'name':  request.user.first_name or request.user.username,
+        'email': request.user.email,
+    }
+    # signs + timestamps the payload; max_age enforced on the other end
+    token = signing.dumps(payload, salt='streamlit-login')
+    streamlit_url = getattr(settings, 'STREAMLIT_URL', 'http://localhost:8501')
+    return redirect(f"{streamlit_url}/?token={token}")
 
-# 2. Add it to your routes
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('', include('social_django.urls', namespace='social')),
-    path('streamlit-login/', redirect_to_streamlit, name='streamlit_login'), # New route
+    path('streamlit-login/', redirect_to_streamlit, name='streamlit_login'),
 ]
