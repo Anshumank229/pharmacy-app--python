@@ -1,10 +1,4 @@
 # frontend/auth.py
-# ─────────────────────────────────────────
-# Three responsibilities:
-#   1. init_session_state()  – safe defaults on every cold start
-#   2. handle_google_redirect() – catch ?email=&name= after OAuth
-#   3. load_profile_once()   – merge saved address/phone into user dict
-# ─────────────────────────────────────────
 import streamlit as st
 import requests
 from config import API_URL
@@ -17,7 +11,7 @@ def init_session_state():
         "show_analytics":       False,
         "show_medicine_detail": False,
         "selected_medicine_id": None,
-        "cart":                 [],
+        "cart":                 [],   # list of dicts: {id, name, price, quantity, requires_rx}
         "user":                 None,
         "last_area_name":       "",
         "last_pending_count":   0,
@@ -28,25 +22,51 @@ def init_session_state():
 
 
 def handle_google_redirect():
+    """
+    Called after Google OAuth redirect.
+    Exchanges the signed ?token= param via the backend — never trusts
+    raw email/name from the URL, preventing spoofed logins.
+    """
     qp = st.query_params
-    if "email" not in qp or "name" not in qp:
+    if "token" not in qp:
         return
-    email, name = qp["email"], qp["name"]
+
+    token = qp["token"]
+    st.query_params.clear()
+
     try:
-        r = requests.get(f"{API_URL}/me", params={"email": email}, timeout=5)
-        is_admin = r.json().get("is_admin", False) if r.ok else False
+        r = requests.get(f"{API_URL}/resolve-token", params={"token": token}, timeout=5)
+        if not r.ok:
+            st.error("Login failed or link expired. Please try again.")
+            return
+        data  = r.json()
+        email = data.get("email", "")
+        name  = data.get("name", "")
+    except requests.exceptions.RequestException:
+        st.warning("Could not verify login — check your connection and try again.")
+        return
+
+    # Fetch admin status from backend
+    try:
+        me = requests.get(f"{API_URL}/me", params={"email": email}, timeout=5)
+        is_admin = me.json().get("is_admin", False) if me.ok else False
     except requests.exceptions.RequestException:
         is_admin = False
 
     st.session_state.user = {"name": name, "email": email, "is_admin": is_admin}
-    # FIX: clear params first, then rerun so the logged-in sidebar renders
-    st.query_params.clear()
-    st.rerun()
 
 
 def load_profile_once():
+    """
+    Fetches saved delivery details once per session and merges them into
+    session_state.user so checkout fields are pre-filled.
+
+    Uses finally to guarantee profile_loaded is always set — even on network
+    failure — so a flaky backend doesn't cause infinite retries on every rerun.
+    """
     if not st.session_state.user or "profile_loaded" in st.session_state:
         return
+
     try:
         r = requests.get(
             f"{API_URL}/profile",
@@ -61,6 +81,13 @@ def load_profile_once():
                 "pincode":   p.get("pincode",   ""),
                 "area_name": p.get("area_name", ""),
             })
+        # 404 = new user with no saved profile, that's fine
+
     except requests.exceptions.RequestException:
-        pass
-    st.session_state.profile_loaded = True
+        st.toast(
+            "⚠️ Could not load saved profile — fill in your details manually.",
+            icon="⚠️",
+        )
+
+    finally:
+        st.session_state.profile_loaded = True

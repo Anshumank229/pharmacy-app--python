@@ -2,7 +2,6 @@
 import os
 import django
 import secrets
-import shutil
 import uuid
 from datetime import datetime, date
 
@@ -19,6 +18,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Depends, 
 from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, field_validator, Field
 from typing import List, Optional, Literal
 from django.db import transaction
@@ -33,6 +33,7 @@ import threading
 django_app = get_wsgi_application()
 
 from inventory.models import Medicine, Category, Order, OrderItem, Review, ServiceArea, UserProfile, Coupon, MedicineBatch
+from supabase_storage import upload_file, delete_file, public_url
 
 app = FastAPI(title="Medicine Delivery API")
 
@@ -50,25 +51,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-os.makedirs("media/prescriptions", exist_ok=True)
-os.makedirs("media/medicines", exist_ok=True)
-os.makedirs("media/invoices", exist_ok=True)
+# Only create local media dirs in dev (no Supabase configured)
+if not django_settings.USE_SUPABASE_STORAGE:
+    os.makedirs("media/prescriptions", exist_ok=True)
+    os.makedirs("media/medicines", exist_ok=True)
+    os.makedirs("media/invoices", exist_ok=True)
 
-# FIX: read from Django settings so there's one source of truth
 ADMIN_API_KEY = getattr(django_settings, 'ADMIN_API_KEY', 'change-me-in-production')
-
-# Allowed prescription file extensions
 ALLOWED_RX_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.pdf'}
 
 
 # ==========================================
 # EMAIL HELPERS
-# All emails are sent in background threads so they never
-# slow down the API response — fire and forget.
 # ==========================================
 
 def _send_email_bg(subject: str, message: str, recipient: str):
-    """Internal: send email in a background thread."""
     def _send():
         try:
             send_mail(
@@ -79,7 +76,7 @@ def _send_email_bg(subject: str, message: str, recipient: str):
                 fail_silently=True,
             )
         except Exception:
-            pass  # Never crash the API over email failure
+            pass
     threading.Thread(target=_send, daemon=True).start()
 
 
@@ -178,7 +175,7 @@ Total paid: ₹{float(order.total_price):.2f} (cash on delivery)
 
 You can download your invoice anytime from "My Profile & Orders" in our store.
 
-We'd love to hear your feedback — you can leave a review for each medicine on our storefront. It helps other customers and helps us improve!
+We'd love to hear your feedback — you can leave a review for each medicine on our storefront.
 
 Need to reorder? Just visit our store and click "🔄 Reorder" on this order.
 
@@ -204,7 +201,6 @@ If we cancelled your order, please contact us on WhatsApp and we'll sort it out 
 
 
 def send_new_order_admin_email(order: Order):
-    """FIX: Notify admin by email whenever a new order arrives."""
     admin_email = os.getenv('EMAIL_HOST_USER', '')
     if not admin_email:
         return
@@ -240,8 +236,6 @@ def verify_admin(x_admin_key: str = Header(...)):
 
 # ==========================================
 # SCHEMAS
-# FIX: added Field(max_length=...) to all user-supplied string fields
-#      to prevent absurdly large inputs
 # ==========================================
 class CategorySchema(BaseModel):
     name: str
@@ -263,8 +257,10 @@ class MedicineSchema(BaseModel):
         if not value:
             return None
         if hasattr(value, 'name'):
-            return value.name
-        return str(value)
+            # ImageField — convert relative path to correct URL
+            return public_url(value.name)
+        v = str(value)
+        return public_url(v)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -288,25 +284,24 @@ class MedicineDetailSchema(BaseModel):
         if not value:
             return None
         if hasattr(value, 'name'):
-            return value.name
-        return str(value)
+            return public_url(value.name)
+        return public_url(str(value))
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class OrderItemCreateSchema(BaseModel):
     medicine_id: int
-    quantity: int = Field(..., ge=1, le=100)  # FIX: cap quantity per item
+    quantity: int = Field(..., ge=1, le=100)
 
 
 class OrderCreateSchema(BaseModel):
-    # FIX: max_length on every user-supplied field
-    customer_name: str    = Field(..., min_length=1, max_length=255)
-    customer_email: str   = Field(..., max_length=254)
-    customer_phone: str   = Field(..., min_length=7, max_length=15)
-    delivery_address: str = Field(..., min_length=5, max_length=500)
-    pincode: str          = Field(..., min_length=6, max_length=10)
-    prescription_image: Optional[str] = Field(None, max_length=255)
+    customer_name: str     = Field(..., min_length=1, max_length=255)
+    customer_email: str    = Field(..., max_length=254)
+    customer_phone: str    = Field(..., min_length=7, max_length=15)
+    delivery_address: str  = Field(..., min_length=5, max_length=500)
+    pincode: str           = Field(..., min_length=6, max_length=10)
+    prescription_image: Optional[str] = Field(None, max_length=500)  # now a URL or filename
     coupon_code: Optional[str]        = Field(None, max_length=20)
     items: List[OrderItemCreateSchema] = Field(..., min_length=1, max_length=50)
 
@@ -350,8 +345,8 @@ class OrderDetailSchema(BaseModel):
 
 
 class UserRegisterSchema(BaseModel):
-    name: str  = Field(..., min_length=1, max_length=150)
-    email: str = Field(..., max_length=254)
+    name: str     = Field(..., min_length=1, max_length=150)
+    email: str    = Field(..., max_length=254)
     password: str = Field(..., min_length=8, max_length=128)
 
 
@@ -361,12 +356,12 @@ class UserLoginSchema(BaseModel):
 
 
 class ProfileUpdateSchema(BaseModel):
-    email: str      = Field(..., max_length=254)
-    name: str       = Field(..., max_length=150)
-    phone: str      = Field(..., max_length=15)
-    address: str    = Field(..., max_length=500)
-    pincode: str    = Field(..., max_length=10)
-    area_name: str  = Field("", max_length=100)
+    email: str     = Field(..., max_length=254)
+    name: str      = Field(..., max_length=150)
+    phone: str     = Field(..., max_length=15)
+    address: str   = Field(..., max_length=500)
+    pincode: str   = Field(..., max_length=10)
+    area_name: str = Field("", max_length=100)
 
 
 class ReviewSchema(BaseModel):
@@ -378,21 +373,16 @@ class ReviewSchema(BaseModel):
 
 
 class ReviewCreateSchema(BaseModel):
-    customer_name: str    = Field(..., min_length=1, max_length=255)
-    rating: int           = Field(..., ge=1, le=5)
+    customer_name: str     = Field(..., min_length=1, max_length=255)
+    rating: int            = Field(..., ge=1, le=5)
     comment: Optional[str] = Field(None, max_length=2000)
 
 
 # ==========================================
-# HELPER — resolve signed login token
-# FIX: Streamlit exchanges the token here instead of reading raw email from URL
+# HELPER — signed login token
 # ==========================================
 @app.get("/api/resolve-token")
 def resolve_token(token: str):
-    """
-    Called by Streamlit after Google OAuth redirect.
-    Validates the signed token (max age 5 minutes) and returns name + email.
-    """
     try:
         payload = signing.loads(token, salt='streamlit-login', max_age=300)
         return {"name": payload["name"], "email": payload["email"]}
@@ -435,14 +425,14 @@ def serialize_order(order):
 # ==========================================
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "supabase": django_settings.USE_SUPABASE_STORAGE}
 
 
 # ==========================================
 # ROUTES — AUTH
 # ==========================================
 @app.post("/api/register")
-@limiter.limit("5/minute")  # FIX: rate-limit registration to slow enumeration
+@limiter.limit("5/minute")
 def register_user(request: Request, user_data: UserRegisterSchema):
     if User.objects.filter(username=user_data.email).exists():
         raise HTTPException(status_code=400, detail="Email already registered.")
@@ -505,9 +495,9 @@ def update_profile(data: ProfileUpdateSchema):
     user.first_name = data.name
     user.save()
     profile, _ = UserProfile.objects.get_or_create(user=user)
-    profile.phone = data.phone
-    profile.address = data.address
-    profile.pincode = data.pincode
+    profile.phone     = data.phone
+    profile.address   = data.address
+    profile.pincode   = data.pincode
     profile.area_name = data.area_name
     profile.save()
     return {"message": "Profile saved."}
@@ -552,7 +542,6 @@ def get_medicines(category_id: Optional[int] = None, search: Optional[str] = Non
     if category_id is not None:
         medicines = medicines.filter(category_id=category_id)
     if search is not None:
-        # FIX: cap search length to avoid abuse
         search = search[:100]
         medicines = medicines.filter(name__icontains=search) | medicines.filter(brand__icontains=search)
     return list(medicines)
@@ -567,16 +556,49 @@ def get_medicine(medicine_id: int):
 
 
 # ==========================================
+# ROUTES — MEDICINE IMAGE UPLOAD (Admin)
+# Uploads image to Supabase, saves public URL to medicine.image
+# ==========================================
+@app.post("/api/admin/medicines/{medicine_id}/image", dependencies=[Depends(verify_admin)])
+async def upload_medicine_image(medicine_id: int, file: UploadFile = File(...)):
+    allowed = {'.jpg', '.jpeg', '.png', '.webp'}
+    ext = os.path.splitext(file.filename or '')[1].lower()
+    if ext not in allowed:
+        raise HTTPException(status_code=400, detail="Only JPG, PNG, or WebP images are allowed.")
+
+    try:
+        medicine = Medicine.objects.get(id=medicine_id)
+    except Medicine.DoesNotExist:
+        raise HTTPException(status_code=404, detail="Medicine not found")
+
+    file_bytes = await file.read()
+    filename = f"med_{medicine_id}_{uuid.uuid4().hex[:8]}{ext}"
+
+    content_type_map = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}
+    content_type = content_type_map.get(ext, 'image/jpeg')
+
+    try:
+        url = upload_file(file_bytes, filename, folder="medicines", content_type=content_type)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Save the URL/path directly on the medicine's image field
+    medicine.image = url
+    medicine.save(update_fields=['image'])
+
+    return {"url": public_url(url), "filename": filename}
+
+
+# ==========================================
 # ROUTES — BATCH EXPIRY
 # ==========================================
 @app.get("/api/admin/batches/alerts", dependencies=[Depends(verify_admin)])
 def get_batch_alerts():
-    today = timezone.now().date()
+    today      = timezone.now().date()
     alert_date = today + timezone.timedelta(days=30)
 
     expiring = MedicineBatch.objects.filter(
-        expiry_date__gte=today,
-        expiry_date__lte=alert_date
+        expiry_date__gte=today, expiry_date__lte=alert_date
     ).select_related('medicine').order_by('expiry_date')
 
     expired = MedicineBatch.objects.filter(
@@ -615,8 +637,8 @@ def get_analytics():
     from django.db.models.functions import TruncDate
 
     orders = Order.objects.exclude(status='CANCELLED')
-
     thirty_days_ago = timezone.now() - timezone.timedelta(days=30)
+
     daily = (
         orders.filter(created_at__gte=thirty_days_ago)
         .annotate(day=TruncDate('created_at'))
@@ -632,16 +654,8 @@ def get_analytics():
         .order_by('-total_qty')[:10]
     )
 
-    by_pincode = (
-        Order.objects.values('pincode')
-        .annotate(count=Count('id'))
-        .order_by('-count')
-    )
-
-    status_counts = (
-        Order.objects.values('status')
-        .annotate(count=Count('id'))
-    )
+    by_pincode    = Order.objects.values('pincode').annotate(count=Count('id')).order_by('-count')
+    status_counts = Order.objects.values('status').annotate(count=Count('id'))
 
     total_revenue = orders.aggregate(total=Sum('total_price'))['total'] or 0
     total_orders  = Order.objects.count()
@@ -664,36 +678,55 @@ def get_analytics():
             {"name": m['medicine__name'], "qty_sold": m['total_qty'], "revenue": float(m['total_revenue'] or 0)}
             for m in top_medicines
         ],
-        "by_pincode": [{"pincode": p['pincode'], "orders": p['count']} for p in by_pincode],
+        "by_pincode":       [{"pincode": p['pincode'], "orders": p['count']} for p in by_pincode],
         "status_breakdown": {s['status']: s['count'] for s in status_counts},
     }
 
 
 # ==========================================
 # ROUTES — PRESCRIPTIONS
+# Upload to Supabase; serve via signed URL for admin
 # ==========================================
 @app.post("/api/upload-prescription")
 @limiter.limit("20/minute")
-def upload_prescription(request: Request, file: UploadFile = File(...)):
-    ext = os.path.splitext(file.filename)[1].lower()
+async def upload_prescription(request: Request, file: UploadFile = File(...)):
+    ext = os.path.splitext(file.filename or '')[1].lower()
     if ext not in ALLOWED_RX_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Only JPG, PNG, or PDF files are allowed.")
+
     safe_filename = f"{uuid.uuid4().hex}{ext}"
-    file_location = f"media/prescriptions/{safe_filename}"
-    with open(file_location, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    return {"filename": safe_filename}
+    file_bytes    = await file.read()
+
+    content_type = 'application/pdf' if ext == '.pdf' else 'image/jpeg'
+
+    try:
+        stored = upload_file(file_bytes, safe_filename, folder="prescriptions", content_type=content_type)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"filename": stored}  # full URL in prod, relative path in dev
 
 
 @app.get("/api/prescriptions/{filename}")
 def serve_prescription(filename: str, x_admin_key: str = Header(...)):
+    """
+    In dev: serves from local disk.
+    In production: redirects to the Supabase public URL.
+    """
     if not secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
         raise HTTPException(status_code=403, detail="Unauthorized")
-    # FIX: basename + extension whitelist on read, not just on write
+
     safe_filename = os.path.basename(filename)
     ext = os.path.splitext(safe_filename)[1].lower()
     if ext not in ALLOWED_RX_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Invalid file type.")
+
+    if django_settings.USE_SUPABASE_STORAGE:
+        # In production the filename stored in DB is already a full URL
+        from fastapi.responses import RedirectResponse
+        url = public_url(filename)
+        return RedirectResponse(url=url)
+
     path = f"media/prescriptions/{safe_filename}"
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File not found")
@@ -710,7 +743,6 @@ def download_invoice(order_id: int, email: str):
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # FIX: ownership check — same as cancel
     if order.customer_email.lower() != email.lower():
         raise HTTPException(status_code=403, detail="Unauthorized")
 
@@ -721,13 +753,13 @@ def download_invoice(order_id: int, email: str):
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     except ImportError:
-        raise HTTPException(status_code=500, detail="reportlab not installed. Run: pip install reportlab")
+        raise HTTPException(status_code=500, detail="reportlab not installed.")
 
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm,
-                            leftMargin=20*mm, rightMargin=20*mm)
-    styles = getSampleStyleSheet()
-    elements = []
+    doc    = SimpleDocTemplate(buffer, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm,
+                                leftMargin=20*mm, rightMargin=20*mm)
+    styles    = getSampleStyleSheet()
+    elements  = []
 
     title_style = ParagraphStyle('title', parent=styles['Heading1'], fontSize=20, spaceAfter=4)
     sub_style   = ParagraphStyle('sub',   parent=styles['Normal'],   fontSize=10, textColor=colors.grey)
@@ -752,10 +784,10 @@ def download_invoice(order_id: int, email: str):
     elements.append(Spacer(1, 2*mm))
 
     table_data = [['Medicine', 'Qty', 'Unit Price', 'Total']]
-    subtotal = 0
+    subtotal   = 0
     for item in order.items.all():
         line_total = item.quantity * float(item.price_at_time_of_purchase)
-        subtotal += line_total
+        subtotal  += line_total
         table_data.append([
             item.medicine.name,
             str(item.quantity),
@@ -804,13 +836,13 @@ def download_invoice(order_id: int, email: str):
 # ROUTES — ORDERS
 # ==========================================
 @app.post("/api/orders", response_model=OrderResponseSchema)
-@limiter.limit("10/minute")  # FIX: rate-limit checkout to deter stock-flooding attacks
+@limiter.limit("10/minute")
 def checkout(request: Request, order_in: OrderCreateSchema):
     area = ServiceArea.objects.filter(pincode=order_in.pincode.strip(), is_active=True).first()
     if not area:
         raise HTTPException(status_code=400, detail="We don't deliver to this pincode yet.")
 
-    item_ids   = [i.medicine_id for i in order_in.items]
+    item_ids    = [i.medicine_id for i in order_in.items]
     rx_required = Medicine.objects.filter(id__in=item_ids, requires_prescription=True).exists()
     if rx_required and not order_in.prescription_image:
         raise HTTPException(status_code=400, detail="A prescription is required for one or more items.")
@@ -826,7 +858,7 @@ def checkout(request: Request, order_in: OrderCreateSchema):
                 status='PENDING',
                 prescription_image=order_in.prescription_image,
                 coupon_code=order_in.coupon_code,
-                discount_applied=0,  # set below after coupon atomically
+                discount_applied=0,
             )
 
             total_order_price = 0
@@ -853,8 +885,6 @@ def checkout(request: Request, order_in: OrderCreateSchema):
 
             discount_percent = 0
             if order_in.coupon_code:
-                # FIX: atomic coupon increment — prevents race condition where two
-                # simultaneous checkouts both pass the "times_used < max_uses" check
                 updated = Coupon.objects.filter(
                     code=order_in.coupon_code.upper().strip(),
                     is_active=True,
@@ -864,17 +894,17 @@ def checkout(request: Request, order_in: OrderCreateSchema):
                 if not updated:
                     raise HTTPException(status_code=400, detail="Invalid or expired coupon code.")
 
-                coupon = Coupon.objects.get(code=order_in.coupon_code.upper().strip())
+                coupon           = Coupon.objects.get(code=order_in.coupon_code.upper().strip())
                 discount_percent = coupon.discount_percent
                 total_order_price *= (1 - discount_percent / 100)
 
             order.discount_applied = discount_percent
-            order.total_price = round(total_order_price, 2)
+            order.total_price      = round(total_order_price, 2)
             order.save()
 
             order_with_items = Order.objects.prefetch_related('items__medicine').get(id=order.id)
             send_order_confirmation_email(order_with_items)
-            send_new_order_admin_email(order_with_items)  # FIX: alert admin
+            send_new_order_admin_email(order_with_items)
 
             return {
                 "id": order.id,
@@ -890,13 +920,10 @@ def checkout(request: Request, order_in: OrderCreateSchema):
         raise HTTPException(status_code=500, detail=f"Checkout failed: {str(e)}")
 
 
-# FIX: require email param so only the order's owner can fetch it
 @app.get("/api/orders/{order_id}", response_model=OrderDetailSchema)
 def get_order(order_id: int, email: str):
     try:
-        order = Order.objects.prefetch_related('items__medicine').get(
-            id=order_id, customer_email=email
-        )
+        order = Order.objects.prefetch_related('items__medicine').get(id=order_id, customer_email=email)
         return serialize_order(order)
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -911,9 +938,7 @@ def get_my_orders(email: str):
 @app.put("/api/orders/{order_id}/cancel")
 def cancel_order(order_id: int, email: str):
     try:
-        order = Order.objects.prefetch_related('items__medicine').get(
-            id=order_id, customer_email=email
-        )
+        order = Order.objects.prefetch_related('items__medicine').get(id=order_id, customer_email=email)
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found.")
 
@@ -927,9 +952,7 @@ def cancel_order(order_id: int, email: str):
         order.status = 'CANCELLED'
         order.save()
 
-    order_with_items = Order.objects.prefetch_related('items__medicine').get(id=order_id)
-    send_cancelled_email(order_with_items)
-
+    send_cancelled_email(Order.objects.prefetch_related('items__medicine').get(id=order_id))
     return {"message": "Order cancelled and stock restored."}
 
 
@@ -952,7 +975,7 @@ def update_order_status(
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found.")
 
-    old_status  = order.status
+    old_status   = order.status
     order.status = status
     order.save()
 
@@ -962,7 +985,6 @@ def update_order_status(
         elif status == 'DELIVERED':
             send_delivered_email(order)
         elif status == 'CANCELLED':
-            # FIX: restore stock when admin cancels an order
             if old_status != 'DELIVERED':
                 with transaction.atomic():
                     for item in order.items.all():
@@ -982,7 +1004,7 @@ def get_reviews(medicine_id: int):
 
 
 @app.post("/api/medicines/{medicine_id}/reviews", response_model=ReviewSchema)
-@limiter.limit("10/minute")  # FIX: prevent review spam
+@limiter.limit("10/minute")
 def create_review(request: Request, medicine_id: int, review_in: ReviewCreateSchema):
     try:
         medicine = Medicine.objects.get(id=medicine_id)
@@ -997,6 +1019,6 @@ def create_review(request: Request, medicine_id: int, review_in: ReviewCreateSch
 
 
 # ==========================================
-# MOUNT DJANGO
+# MOUNT DJANGO (must be last)
 # ==========================================
 app.mount("/", WSGIMiddleware(django_app))
