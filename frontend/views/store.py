@@ -284,8 +284,25 @@ def _open_detail(med_id: int):
 
 def _inline_reviews(med: dict):
     try:
-        r = requests.get(f"{API_URL}/medicines/{med['id']}/reviews", timeout=8)
-        reviews = r.json() if r.ok else []
+        if "page" not in st.session_state:
+            st.session_state.page = 1
+
+        r = requests.get(
+            f"{API_URL}/medicines",
+            params={
+                "category_id": category_id,
+                "search": search_input,
+                "page": st.session_state.page,
+                "page_size": 40,
+            },
+            timeout=10,
+        )
+
+        data = r.json() if r.ok else {"items": [], "total": 0, "total_pages": 1}
+        medicines = data.get("items", [])
+        total_pages = data.get("total_pages", 1)
+        has_next = data.get("has_next", False)
+        has_prev = data.get("has_prev", False)
     except requests.exceptions.RequestException:
         st.caption("Could not load reviews.")
         return

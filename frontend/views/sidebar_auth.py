@@ -79,6 +79,7 @@ def _do_login(email: str, password: str):
                 "email":    d.get("email",    ""),
                 "is_admin": d.get("is_admin", False),
             }
+            st.session_state.access_token = d.get("access_token")  # ← ADD THIS LINE
             st.rerun()
         elif r.status_code == 429:
             st.sidebar.error("Too many attempts — wait a minute.")
@@ -90,6 +91,15 @@ def _do_login(email: str, password: str):
                 timeout=10,
             )
             if reg.status_code in (200, 201):
+                # Auto-login after register to get the token
+                login_r = requests.post(
+                    f"{API_URL}/login",
+                    json={"email": email, "password": password},
+                    timeout=10,
+                )
+                if login_r.ok:
+                    ld = login_r.json()
+                    st.session_state.access_token = ld.get("access_token")  # ← ADD
                 st.session_state.user = {"name": default_name, "email": email, "is_admin": False}
                 st.sidebar.success("Account created — welcome!")
                 st.rerun()
@@ -134,5 +144,6 @@ def _user_card():
 
     if st.sidebar.button("Logout", width='stretch', key="auth_logout"):
         st.session_state.user = None
+        st.session_state.access_token = None
         st.session_state.pop("profile_loaded", None)
         st.rerun()

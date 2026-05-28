@@ -4,6 +4,8 @@ import django
 import secrets
 import uuid
 from datetime import datetime, date
+from slowapi.errors import RateLimitExceeded
+from auth import create_access_token, get_current_user, get_current_admin, validate_upload
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings')
 django.setup()
@@ -461,7 +463,8 @@ def login_user(request: Request, user_data: UserLoginSchema):
 
 
 @app.get("/api/me")
-def get_me(email: str):
+def get_me(current_user: dict = Depends(get_current_user)):
+    email = current_user["sub"]
     user = User.objects.filter(email=email).first()
     if not user:
         return {"is_admin": False}
@@ -472,7 +475,38 @@ def get_me(email: str):
 # ROUTES — USER PROFILE
 # ==========================================
 @app.get("/api/profile")
-def get_profile(email: str):
+def get_profile(current_user: dict = Depends(get_current_user)):
+    email = current_user["sub"]
+    user = User.objects.filter(email=email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    return {
+        "name": user.first_name,
+        "email": user.email,
+        "phone": profile.phone,
+        "address": profile.address,
+        "pincode": profile.pincode,
+        "area_name": profile.area_name,
+    }
+
+@app.put("/api/profile")
+def update_profile(data: ProfileUpdateSchema, current_user: dict = Depends(get_current_user)):
+    email = current_user["sub"]
+    if data.email.lower() != email.lower():
+        raise HTTPException(status_code=403, detail="Cannot update another user's profile.")
+    user = User.objects.filter(email=email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.first_name = data.name
+    user.save()
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    profile.phone = data.phone
+    profile.address = data.address
+    profile.pincode = data.pincode
+    profile.area_name = data.area_name
+    profile.save()
+    return {"message": "Profile saved."}
     user = User.objects.filter(email=email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -536,15 +570,38 @@ def get_categories():
 # ==========================================
 # ROUTES — MEDICINES
 # ==========================================
-@app.get("/api/medicines", response_model=List[MedicineSchema])
-def get_medicines(category_id: Optional[int] = None, search: Optional[str] = None):
+
+@app.get("/api/medicines")
+def get_medicines(
+    category_id: Optional[int] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 40,
+):
+    page      = max(1, page)
+    page_size = max(1, min(page_size, 100))   # hard cap at 100 per page
+    offset    = (page - 1) * page_size
+
     medicines = Medicine.objects.select_related('category').all()
+
     if category_id is not None:
         medicines = medicines.filter(category_id=category_id)
     if search is not None:
         search = search[:100]
         medicines = medicines.filter(name__icontains=search) | medicines.filter(brand__icontains=search)
-    return list(medicines)
+
+    total = medicines.count()
+    page_items = list(medicines[offset: offset + page_size])
+
+    return {
+        "items":       [MedicineSchema.model_validate(m) for m in page_items],
+        "total":       total,
+        "page":        page,
+        "page_size":   page_size,
+        "total_pages": max(1, -(-total // page_size)),   # ceiling division
+        "has_next":    offset + page_size < total,
+        "has_prev":    page > 1,
+    }
 
 
 @app.get("/api/medicines/{medicine_id}", response_model=MedicineDetailSchema)
@@ -689,13 +746,16 @@ def get_analytics():
 # ==========================================
 @app.post("/api/upload-prescription")
 @limiter.limit("20/minute")
-async def upload_prescription(request: Request, file: UploadFile = File(...)):
-    ext = os.path.splitext(file.filename or '')[1].lower()
-    if ext not in ALLOWED_RX_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Only JPG, PNG, or PDF files are allowed.")
-
+async def upload_prescription(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+):
+    file_bytes = await file.read()
+    content_type = validate_upload(file_bytes)  # checks size AND magic bytes
+    ext_map = {"image/jpeg": ".jpg", "image/png": ".png", "application/pdf": ".pdf"}
+    ext = ext_map[content_type]
     safe_filename = f"{uuid.uuid4().hex}{ext}"
-    file_bytes    = await file.read()
 
     content_type = 'application/pdf' if ext == '.pdf' else 'image/jpeg'
 
@@ -737,12 +797,12 @@ def serve_prescription(filename: str, x_admin_key: str = Header(...)):
 # ROUTES — PDF INVOICE
 # ==========================================
 @app.get("/api/orders/{order_id}/invoice")
-def download_invoice(order_id: int, email: str):
+def download_invoice(order_id: int, current_user: dict = Depends(get_current_user)):
+    email = current_user["sub"]
     try:
         order = Order.objects.prefetch_related('items__medicine').get(id=order_id)
     except Order.DoesNotExist:
         raise HTTPException(status_code=404, detail="Order not found")
-
     if order.customer_email.lower() != email.lower():
         raise HTTPException(status_code=403, detail="Unauthorized")
 
@@ -930,13 +990,28 @@ def get_order(order_id: int, email: str):
 
 
 @app.get("/api/my-orders", response_model=List[OrderDetailSchema])
-def get_my_orders(email: str):
+def get_my_orders(current_user: dict = Depends(get_current_user)):
+    email = current_user["sub"]
     orders = Order.objects.filter(customer_email=email).prefetch_related('items__medicine').order_by('-created_at')
     return [serialize_order(o) for o in orders]
 
-
 @app.put("/api/orders/{order_id}/cancel")
-def cancel_order(order_id: int, email: str):
+def cancel_order(order_id: int, current_user: dict = Depends(get_current_user)):
+    email = current_user["sub"]
+    try:
+        order = Order.objects.prefetch_related('items__medicine').get(id=order_id, customer_email=email)
+    except Order.DoesNotExist:
+        raise HTTPException(status_code=404, detail="Order not found.")
+    if order.status != 'PENDING':
+        raise HTTPException(status_code=400, detail="Only pending orders can be cancelled.")
+    with transaction.atomic():
+        for item in order.items.all():
+            item.medicine.stock += item.quantity
+            item.medicine.save()
+        order.status = 'CANCELLED'
+        order.save()
+    send_cancelled_email(Order.objects.prefetch_related('items__medicine').get(id=order_id))
+    return {"message": "Order cancelled and stock restored."}
     try:
         order = Order.objects.prefetch_related('items__medicine').get(id=order_id, customer_email=email)
     except Order.DoesNotExist:
@@ -959,10 +1034,39 @@ def cancel_order(order_id: int, email: str):
 # ==========================================
 # ROUTES — ADMIN ORDERS
 # ==========================================
-@app.get("/api/admin/orders", response_model=List[OrderDetailSchema], dependencies=[Depends(verify_admin)])
-def get_all_orders():
+@app.get("/api/admin/orders", dependencies=[Depends(verify_admin)])
+def get_all_orders(
+    page: int = 1,
+    page_size: int = 50,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    page      = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset    = (page - 1) * page_size
+
     orders = Order.objects.prefetch_related('items__medicine').order_by('-created_at')
-    return [serialize_order(o) for o in orders]
+
+    if status and status in ('PENDING', 'SHIPPED', 'DELIVERED', 'CANCELLED'):
+        orders = orders.filter(status=status)
+    if search:
+        search = search[:100]
+        orders = orders.filter(customer_name__icontains=search) | \
+                 orders.filter(customer_phone__icontains=search) | \
+                 orders.filter(customer_email__icontains=search)
+
+    total      = orders.count()
+    page_items = orders[offset: offset + page_size]
+
+    return {
+        "items":       [serialize_order(o) for o in page_items],
+        "total":       total,
+        "page":        page,
+        "page_size":   page_size,
+        "total_pages": max(1, -(-total // page_size)),
+        "has_next":    offset + page_size < total,
+        "has_prev":    page > 1,
+    }
 
 
 @app.put("/api/admin/orders/{order_id}", dependencies=[Depends(verify_admin)])

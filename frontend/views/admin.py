@@ -4,12 +4,13 @@
 # Call render() from app.py when show_admin is True.
 # Auto-refreshes every 60 seconds.
 # ─────────────────────────────────────────
-import time
 from datetime import datetime
 import streamlit as st
 import requests
+from streamlit_autorefresh import st_autorefresh          # pip install streamlit-autorefresh
 from config import API_URL, ADMIN_HEADERS
 from theme import scroll_to_top
+from auth import auth_headers                             # ← NEW: for invoice download
 
 
 _STATUSES = ["PENDING", "SHIPPED", "DELIVERED", "CANCELLED"]
@@ -30,6 +31,10 @@ _STATUS_EMOJI = {
 
 def render():
     scroll_to_top()
+
+    # ── FIX 1: replace time.sleep(60) + st.rerun() with this ──
+    # Refreshes every 60s without blocking the server thread
+    st_autorefresh(interval=60_000, key="admin_autorefresh")
 
     st.markdown('<div class="page-title">Admin Panel</div>', unsafe_allow_html=True)
     st.markdown(
@@ -59,8 +64,6 @@ def render():
         'Auto-refreshing every 60 seconds</div>',
         unsafe_allow_html=True,
     )
-    time.sleep(60)
-    st.rerun()
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
@@ -155,37 +158,29 @@ def _orders_panel():
 def _order_row(order: dict):
     status = order["status"]
 
-    # FIX: extract all values BEFORE building HTML so formatting errors
-    # never cause the raw HTML to render as escaped text
-    order_id     = order.get("id", "—")
-    name         = order.get("customer_name", "—")
-    phone        = order.get("customer_phone", "—")
-    pincode      = order.get("pincode", "—")
-    address      = order.get("delivery_address", "—")
-    discount     = order.get("discount_applied", 0)
-    coupon       = order.get("coupon_code", "")
-    email        = order.get("customer_email", "")
-    rx_image     = order.get("prescription_image", "")
+    order_id  = order.get("id", "—")
+    name      = order.get("customer_name", "—")
+    phone     = order.get("customer_phone", "—")
+    pincode   = order.get("pincode", "—")
+    address   = order.get("delivery_address", "—")
+    discount  = order.get("discount_applied", 0)
+    coupon    = order.get("coupon_code", "")
+    rx_image  = order.get("prescription_image", "")
 
-    # Safe float conversion — JSON may return string or None
     try:
         total = float(order.get("total_price", 0) or 0)
     except (ValueError, TypeError):
         total = 0.0
 
-    pill_class = _STATUS_PILL.get(status, "pill-pending")
-    emoji      = _STATUS_EMOJI.get(status, "📦")
-
+    pill_class    = _STATUS_PILL.get(status, "pill-pending")
+    emoji         = _STATUS_EMOJI.get(status, "📦")
     discount_html = (
         f'&nbsp;·&nbsp; 🎟 <b>{coupon}</b> ({discount}% off)'
         if discount else ""
     )
-
-    # Build HTML with all values pre-formatted — no f-string formatting inside HTML
     total_str = f"₹{total:.2f}"
 
     with st.container():
-        # Card header — pure HTML, no Python formatting inside the string
         st.markdown(f"""
 <div class="admin-order-card">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
@@ -206,19 +201,36 @@ def _order_row(order: dict):
 </div>
 """, unsafe_allow_html=True)
 
-        # Links + status control — using native Streamlit below the card
         link_col, ctrl_col = st.columns([3, 1])
 
         with link_col:
-            links = []
+            # ── FIX 2: prescription still uses admin key (correct — admin-only route)
             if rx_image:
-                links.append(
-                    f"[📄 View prescription](http://127.0.0.1:8000/api/prescriptions/{rx_image})"
+                st.markdown(
+                    f"[📄 View prescription]({API_URL}/prescriptions/{rx_image})"
+                    f"  *(open in browser with admin key header)*"
                 )
-            links.append(
-                f"[🧾 Download invoice]({API_URL}/orders/{order_id}/invoice?email={email})"
-            )
-            st.markdown("  &nbsp;&nbsp;  ".join(links))
+
+            # ── FIX 3: invoice now fetched with JWT token, not bare URL with email param ──
+            if st.button("🧾 Download invoice", key=f"inv_{order_id}"):
+                try:
+                    inv_r = requests.get(
+                        f"{API_URL}/orders/{order_id}/invoice",
+                        headers=auth_headers(),   # ← JWT token, not ?email= param
+                        timeout=15,
+                    )
+                    if inv_r.ok:
+                        st.download_button(
+                            label="⬇️ Save PDF",
+                            data=inv_r.content,
+                            file_name=f"invoice_{order_id}.pdf",
+                            mime="application/pdf",
+                            key=f"dl_{order_id}",
+                        )
+                    else:
+                        st.error("Could not fetch invoice.")
+                except requests.exceptions.RequestException as e:
+                    st.error(f"Error: {e}")
 
             # Order items summary
             items = order.get("items", [])

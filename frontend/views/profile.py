@@ -8,6 +8,7 @@ import requests
 from config import API_URL
 from helpers import delivery_estimate
 from theme import scroll_to_top
+from auth import auth_headers
 
 
 _STATUS_PILL = {
@@ -46,13 +47,14 @@ def render():
             requests.put(
                 f"{API_URL}/profile",
                 json={
-                    "email":     u["email"],
-                    "name":      new_name,
-                    "phone":     new_phone,
-                    "address":   new_address,
-                    "pincode":   new_pincode,
+                    "email": u["email"],
+                    "name": new_name,
+                    "phone": new_phone,
+                    "address": new_address,
+                    "pincode": new_pincode,
                     "area_name": u.get("area_name", ""),
                 },
+                headers=auth_headers(),
                 timeout=5,
             )
             st.session_state.user.update({
@@ -70,7 +72,7 @@ def render():
     st.markdown("### Order history")
 
     try:
-        r = requests.get(f"{API_URL}/my-orders", params={"email": u["email"]}, timeout=10)
+        r = requests.get(f"{API_URL}/my-orders", headers=auth_headers(), timeout=10)
         orders = r.json() if r.ok else []
     except requests.exceptions.RequestException as e:
         st.error(f"Could not load orders: {e}")
@@ -140,15 +142,32 @@ def _order_card(order: dict, u: dict):
         # Actions row
         a1, a2 = st.columns(2)
         with a1:
-            invoice_url = f"{API_URL}/orders/{order['id']}/invoice?email={u['email']}"
-            st.markdown(f"[📄 Download invoice PDF]({invoice_url})")
+            if st.button("📄 Download invoice", key=f"inv_{order['id']}"):
+                try:
+                    inv_r = requests.get(
+                        f"{API_URL}/orders/{order['id']}/invoice",
+                        headers=auth_headers(),
+                        timeout=15,
+                    )
+                    if inv_r.ok:
+                        st.download_button(
+                            label="⬇️ Save PDF",
+                            data=inv_r.content,
+                            file_name=f"invoice_{order['id']}.pdf",
+                            mime="application/pdf",
+                            key=f"dl_{order['id']}",
+                        )
+                    else:
+                        st.error("Could not fetch invoice.")
+                except requests.exceptions.RequestException as e:
+                    st.error(f"Error: {e}")
         with a2:
             if status == "PENDING":
                 if st.button("Cancel order", key=f"cancel_{order['id']}"):
                     try:
                         cr = requests.put(
                             f"{API_URL}/orders/{order['id']}/cancel",
-                            params={"email": u["email"]},
+                            headers=auth_headers(),  # ← token, no email param
                             timeout=10,
                         )
                         if cr.status_code == 200:

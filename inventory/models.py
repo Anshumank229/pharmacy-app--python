@@ -17,7 +17,7 @@ class Category(models.Model):
 
 
 class Medicine(models.Model):
-    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='medicines')
+    category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name='medicines')
     name = models.CharField(max_length=200)
     brand = models.CharField(max_length=100, blank=True, null=True)
     dosage_form = models.CharField(max_length=50, blank=True, help_text="e.g. Tablet, Capsule, Syrup")
@@ -29,6 +29,12 @@ class Medicine(models.Model):
     requires_prescription = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['name'], name='medicine_name_idx'),
+            models.Index(fields=['category'], name='medicine_category_idx'),
+        ]
 
     def __str__(self):
         return self.name
@@ -132,6 +138,15 @@ class Order(models.Model):
     discount_applied = models.PositiveIntegerField(default=0)
     prescription_image = models.CharField(max_length=255, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['customer_email'], name='order_email_idx'),
+            models.Index(fields=['status'], name='order_status_idx'),
+            models.Index(fields=['created_at'], name='order_created_idx'),
+            models.Index(fields=['pincode'], name='order_pincode_idx'),
+        ]
 
     def __str__(self):
         return f"Order #{self.id} by {self.customer_name}"
